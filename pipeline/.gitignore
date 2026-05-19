@@ -1,0 +1,75 @@
+# --- Secrets ---
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# --- OAuth credentials (Google Cloud client_secrets + cached tokens) ---
+credentials/*
+!credentials/.gitkeep
+!credentials/README.md
+
+# --- Local config (template only is committed) ---
+config.yaml
+config.local.yaml
+
+# --- Logs and runtime artifacts ---
+# Ignore everything inside logs/ EXCEPT the .gitkeep that preserves the dir itself.
+logs/*
+!logs/.gitkeep
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Build artifacts ---
+dist/
+build/
+*.egg-info/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Models (live in C:\ContentOps\_models, but reject any that leak in here) ---
+*.bin
+*.gguf
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.onnx
+
+# --- Media (belong in channels\, never in the code repo) ---
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.flac
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.srt
+*.ass
+*.vtt

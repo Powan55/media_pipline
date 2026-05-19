@@ -1,0 +1,198 @@
+# config.yaml.template
+#
+# Copy to `config.yaml` and adjust. Secrets go in `.env`, never here.
+# `config.yaml` is gitignored so per-machine paths and tweaks stay local.
+#
+# Anything tagged <<TODO>> needs your input before the pipeline can run that stage.
+
+paths:
+  # All paths use Windows-style backslashes; the loader converts to pathlib.Path.
+  contentops_root: C:\ContentOps
+  shared:          C:\ContentOps\_shared
+  models:          C:\ContentOps\_models
+  channel_root:    C:\ContentOps\channels\ShadowVerse
+  logs:            C:\ContentOps\_pipeline\logs
+  prompts:         C:\ContentOps\_pipeline\prompts
+
+channel:
+  name: ShadowVerse
+  niche: ai-tech-productivity
+  # The pipeline reads style_guide.md verbatim and injects it into script-generation prompts.
+  style_guide_path: C:\Users\laxmi\Documents\Project\Channels\ShadowVerse\style_guide.md
+
+llm:
+  primary_provider: manual              # one of: "manual", "anthropic", "openai"
+                                        # "manual" = pipeline writes prompt to a file and halts;
+                                        #           operator (or Claude Code) writes the response
+                                        #           file; pipeline resumes. NO API key needed.
+                                        # "anthropic"/"openai" require the matching SDK in
+                                        # requirements.txt and a key in .env.
+  manual_io_dir: C:\ContentOps\channels\ShadowVerse\02_scripts\_drafts
+                                        # Per-topic subdirs are created here, holding
+                                        # <stage>_PROMPT.txt and <stage>_RESPONSE.txt files.
+  primary_model: claude-sonnet-4-6      # ignored in manual mode; used only by anthropic/openai branches
+  fact_check_model: claude-opus-4-7     # ignored in manual mode
+  max_tokens: 4096                      # ignored in manual mode
+  temperature: 0.4                      # ignored in manual mode
+
+fact_check:
+  provider: manual                      # one of: "manual", "claude_with_websearch", "perplexity"
+                                        # "manual" / "claude_with_websearch" use the same
+                                        # file-IO halt pattern as generate_script — Claude Code
+                                        # in a chat session reads the prompt and writes the
+                                        # response with real web verification.
+  require_human_resolution: true        # SACRED GATE — never set to false in production.
+                                        # This is the sacred-gate kill switch. Even in
+                                        # auto_resolve_gate_2 mode below, this must stay true.
+  auto_resolve_gate_2: false            # When true: gate 2 applies fixes for LIKELY_WRONG +
+                                        # UNCLEAR claims, strips surviving [VERIFY: ...] tags
+                                        # from the body, writes factcheck_AUTO_RESOLUTION.md,
+                                        # and proceeds without halting. Operator's gate-3 final
+                                        # QA review is the only remaining safety net in this
+                                        # mode. Default false (manual gate). Flip to true
+                                        # only when you've validated several batches manually
+                                        # and trust the auto-resolution behavior.
+  gemini_enabled: false                 # Set true to use Gemini Flash-Lite parallel fact-check
+                                        # via tools/factcheck_gemini.py instead of manual halt
+                                        # at gate 2. Free tier; requires GEMINI_API_KEY env var
+                                        # and `pip install google-generativeai`. Output matches
+                                        # the same markdown-table schema as the manual prompt
+                                        # so pipeline._parse_factcheck_response consumes it
+                                        # unchanged. DORMANT by default — pipeline integration
+                                        # is a separate decision after smoke-testing the
+                                        # standalone tool. Until then, run manually:
+                                        #   python tools/factcheck_gemini.py --script <path>
+                                        # See feedback_llm_api_policy.md for the per-feature
+                                        # approval rule and tools/factcheck_gemini.py docstring
+                                        # for activation steps.
+
+script_quality:
+  # Pure-function quality gate that reads the QUALITY_SCORES section the script-gen
+  # prompt asks the LLM to emit (5 dimensions, 0..1 each, equal-weighted mean).
+  # No LLM call — this is a fast post-parse check. See pipeline.evaluate_script_quality.
+  min_score: 0.50                       # weighted-total threshold below which scripts halt
+  enforce_min_score: true               # halt below threshold (flipped on 2026-05-06 after smoke-test scored 0.776, well above 0.50)
+
+tts:
+  provider: edge-tts                    # one of: "edge-tts", "elevenlabs", "f5-tts-local", "xtts-local"
+                                        # "edge-tts" uses Microsoft Edge's neural TTS via a public
+                                        # endpoint — no API key, no install of model weights, decent
+                                        # quality. Default for unattended pipeline runs.
+                                        # "elevenlabs" is a valid value, but DORMANT until the operator
+                                        # subscribes to ElevenLabs Starter, adds ELEVENLABS_API_KEY to
+                                        # .env, adds `elevenlabs` to requirements.txt, and explicitly
+                                        # flips this to "elevenlabs". The SDK is lazy-imported inside
+                                        # the dispatch branch so the rest of the pipeline runs without
+                                        # the dep installed.
+                                        # "f5-tts-local" is the local-GPU voice-cloning option for
+                                        # publish-quality output; requires a separate install + a
+                                        # voice-reference WAV (see voice_ref).
+  edge_tts_voice: en-US-AndrewMultilingualNeural   # see https://github.com/rany2/edge-tts#available-voices
+  rate: "+10%"                          # edge-tts speaking rate. "+0%" = default, "+10%" = ~10% faster.
+                                        # Calibrated 2026-05-07 from gate-3 review on 2026-05-07_003/_004:
+                                        # operator flagged +0% pacing as slightly slow. +10% lifts effective
+                                        # wpm from ~137 to ~151, mid-tier Shorts cadence. Adjust in 5%
+                                        # increments if A/B data suggests different cadence wins.
+  voice_ref: C:\ContentOps\_shared\voice_models\reference_voice.wav  # only used by f5-tts/xtts
+  sample_rate_hz: 48000
+  loudness_lufs: -14                    # legacy single-pass target; superseded by `loudnorm.target_lufs`
+                                        # for Stage 7.5. Kept for back-compat with older configs.
+  # elevenlabs:                         # only consulted when provider == "elevenlabs"
+  #   voice_id: nPczCjzI2devNBz1zQrb    # default = Brian (American baritone)
+  #   model_id: eleven_multilingual_v2  # body-only; v3 is Creator-tier, out of scope
+  #   stability: 0.45
+  #   similarity_boost: 0.85
+  #   style: 0.30
+  #   speed: 1.05
+  #   max_retries: 3
+
+loudnorm:
+  # Stage 7.5 — two-pass EBU R128 loudness normalization on the raw VO WAV.
+  # Replaces the inline single-pass `loudnorm=I=-14:LRA=11:TP=-1.5` filter that
+  # used to live in `_vo_edge_tts` (which drifted all 9 prior masters to
+  # -15.1..-15.6 LUFS). Two-pass measures first, then applies linear correction;
+  # output lands within ±0.5 LU of the target.
+  target_lufs: -14.0                    # YouTube/Spotify integrated-loudness target
+  target_tp: -1.0                       # true-peak ceiling in dBTP (1 dB headroom)
+  target_lra: 11.0                      # loudness range in LU; reasonable for spoken VO
+
+captions:
+  style: word_pop                       # one of: "word_pop" (default — R5 word-by-word pop), "legacy"
+                                        # "word_pop" uses tools/caption_word_pop.render_ass: yellow active
+                                        # word + 96 px settle, white inactive words + 84 px, scale-bounce
+                                        # tween. Visual spec from audit_2026-05-07/phase2_finishing.md.
+                                        # "legacy" emits the original 1-3 word static-block style — kept
+                                        # as a one-flip rollback if word_pop misbehaves on a topic.
+  font_name: "Montserrat Black"         # primary font for word_pop; libass falls through Anton -> Bebas
+                                        # Neue -> Impact -> Arial Black if Montserrat Black is missing.
+                                        # Day 3.2 of the 30/60/90 plan installs Montserrat Black system-wide.
+  whisper_model: large-v3
+  whisper_compute_type: float16         # "float16" for GPU, "int8" for CPU fallback
+  word_level_timestamps: true           # required for word-by-word caption highlight
+
+prepublish_qa:
+  # Stage 11 — runs the 11 hard checks from tools/prepublish_qa.check_variant on
+  # every variant (yt/tt/ig). Enforces R7 stereo, R1 -14 LUFS ±1 LU, codec/res/
+  # framerate, AV parity, caption density, silent-intro/black-frame combo, etc.
+  # Runs after gate 3 (`await_final_qa`) since masters change on rebuild.
+  enabled: true                         # set false to bypass the gate (NOT recommended)
+  check_cited_observation: false        # opt-in R6 check #13 — script_FINAL.txt must contain
+                                        # a URL + a named source. Off by default until the
+                                        # script-gen prompt reliably emits one per draft.
+
+assets:
+  preferred_stock_provider: pexels      # one of: "pexels", "pixabay" (tries the other on no-match)
+  flux_fallback_enabled: true           # generate via local ComfyUI if no good stock match
+  comfyui_endpoint: http://127.0.0.1:8188   # default ComfyUI local server
+
+render:
+  resolution: [1080, 1920]              # 9:16 master
+  framerate: 30
+  bitrate_kbps: 6000
+  audio_codec: aac
+  video_codec: libx264
+  hardware_accel: nvenc                 # NVIDIA GPU encoder; "none" to disable
+
+publishing:
+  kill_switch: false                    # SAFETY — flip true to halt all auto-publish
+  max_publishes_per_platform_per_day: 2 # bot-detection guard
+  human_qa_required: true               # SACRED GATE — never set to false in production
+  manual_youtube_upload: false          # As of 2026-05-07 evening: YouTube uploads are automated via
+                                        # the official Data API (tools/youtube_upload.py), but ALWAYS
+                                        # require explicit per-video operator approval before invocation.
+                                        # The flag here is documentation-only — actual gating is in chat.
+                                        # See memory feedback_youtube_upload_policy.md for the full rule.
+                                        # Cookie auth and third-party uploaders remain banned regardless.
+
+trend_pull:
+  # Reddit and YouTube data sources are DEFERRED — operator pulls trend data manually
+  # for now. Uncomment the relevant block(s) and set the matching keys in .env when you
+  # want to activate either source.
+  #
+  # reddit_subreddits:
+  #   - LocalLLaMA
+  #   - MachineLearning
+  #   - ChatGPT
+  #   - LangChain
+  #   - cursor
+  # youtube_search_terms:
+  #   - "AI tools"
+  #   - "developer productivity"
+  #   - "Claude vs ChatGPT"
+  google_trends_terms:
+    - "AI agents"
+    - "MCP server"
+    # <<TODO: add 2–3 more>>
+  topic_inbox_path: C:\ContentOps\channels\ShadowVerse\01_research\_topic_inbox.md
+
+analytics_pull:
+  # Channel IDs / handles — fill in after creating the platform accounts.
+  youtube_channel_id: <<TODO>>
+  tiktok_username:    <<TODO>>
+  instagram_username: <<TODO>>
+  output_path: C:\ContentOps\channels\ShadowVerse\01_research\_weekly_analytics.csv
+
+logging:
+  level: INFO                           # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  per_run_subdir: true                  # each pipeline run gets its own logs/ subfolder

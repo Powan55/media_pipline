@@ -1,0 +1,14 @@
+{
+  "_doc": "Component weights for the topic-scoring model. Each value is a float; loaded by scoring.load_weights(). The runtime normalizes the sum to 1.0 if it drifts, so partial tuning is safe. Do not add or remove keys without updating scoring.ScoreComponents.",
+  "_default_priors_set_at": "2026-05-05",
+  "_tuning_history": [],
+
+  "niche_fit": 0.18,
+  "hook_strength": 0.15,
+  "specificity": 0.18,
+  "trend_signal": 0.10,
+  "verifiability": 0.10,
+  "broll_feasibility": 0.07,
+  "observation_availability": 0.12,
+  "anti_cannibalization": 0.10
+}

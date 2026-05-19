@@ -1,0 +1,72 @@
+# ShadowVerse pipeline — pinned dependencies.
+#
+# Pin strategy: lower bound = a known-good early-2026 floor, upper bound = next major.
+# This is intentionally NOT hash-pinned. When the pipeline reaches Phase 2 stability,
+# switch to `pip-compile` (pip-tools) or `uv lock` for reproducible hash-pinned installs.
+#
+# IMPORTANT: PyTorch is NOT listed here. Install it separately with the CUDA-matched
+# wheel from https://pytorch.org/get-started/locally/ — mixing the generic PyPI build
+# with a CUDA build silently breaks GPU detection. See README "GPU & PyTorch" section.
+
+# --- LLM clients ---
+# REMOVED on 2026-05-05 by operator decision: pipeline runs in `manual` LLM mode
+# (Claude Code via chat sessions handles all script gen, fact-check, metadata work).
+# Re-add the line below if you ever flip llm.primary_provider in config.yaml to "anthropic":
+#   anthropic>=0.45,<1.0
+# Or for OpenAI:
+#   openai>=1.60,<2.0
+#
+# ADDED 2026-05-08: Gemini Flash-Lite for parallel fact-check (free tier only).
+# Operator approved per-feature under the LLM API policy. Used by
+# tools/factcheck_gemini.py (DORMANT until config.fact_check.gemini_enabled
+# is flipped to true and GEMINI_API_KEY is set in .env). The SDK is
+# lazy-imported inside the function bodies so the rest of the pipeline runs
+# without it installed; this pin ensures `pip install -r requirements.txt`
+# pulls it for activation.
+#
+# 2026-05-08 (later): migrated from `google-generativeai>=0.8,<1.0` (EOL on
+# 2025-11-30) to the unified `google-genai` SDK. Pin covers the stable 1.x
+# series (last 1.74.0 on 2026-04-29) through the 2.x line (2.0.0 released
+# 2026-05-07); upper bound is the next major (3.0). Import path is now
+# `from google import genai`; client is `genai.Client(api_key=...)`.
+google-genai>=1.0,<3.0
+
+# --- HTTP / API ---
+requests>=2.32,<3.0
+httpx>=0.28,<1.0
+
+# --- Trend research ---
+pytrends>=4.9,<5.0                    # Google Trends (unofficial; verify before relying)
+praw>=7.8,<8.0                        # Reddit official wrapper
+feedparser>=6.0,<7.0                  # RSS/Atom for tools/news_rss_poller.py (vendor news drops)
+google-api-python-client>=2.150,<3.0  # YouTube Data API v3 + Analytics API v2
+google-auth-oauthlib>=1.2,<2.0        # Desktop OAuth flow (one-time consent → token cache)
+google-auth-httplib2>=0.2,<1.0        # http transport for the auth library
+
+# --- Audio orchestration ---
+ffmpeg-python>=0.2,<1.0               # Wrapper around ffmpeg CLI; ffmpeg itself must be on PATH
+
+# --- Captions ---
+faster-whisper>=1.1,<2.0              # CTranslate2-backed; faster than openai-whisper
+
+# --- TTS (escape-hatch / placeholder) ---
+edge-tts>=7.0,<8.0                    # Microsoft Edge neural TTS; no key, no model weights install.
+                                      # Used by the default `tts.provider: edge-tts`. F5-TTS would
+                                      # ship voice-cloned audio at higher quality but requires its
+                                      # own install session and conflicts with our pinned tokenizers.
+
+# --- Config + secrets ---
+python-dotenv>=1.0,<2.0
+pyyaml>=6.0,<7.0
+
+# --- Data + typed schemas ---
+pandas>=2.2,<3.0
+pydantic>=2.10,<3.0
+
+# --- NOT installed by this file (intentional) ---
+# - torch / torchvision / torchaudio: install separately via the PyTorch index URL matched
+#   to the user's CUDA version. Do not let pip resolve these from PyPI.
+# - ComfyUI: separate install, not a pip package. Pipeline talks to its HTTP API.
+# - F5-TTS / XTTSv2: install procedure depends on which TTS we settle on (Phase 2 decision).
+# - LangChain / CrewAI / AutoGen / LangGraph: explicitly excluded by design.
+#   See feedback_engineering_principles.md — plain Python with explicit calls only.
