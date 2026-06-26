@@ -77,12 +77,32 @@ Total time: **~6–10 hours/week** at the 30-day system level.
 
 ## Saturday — Engagement (30–45 min)
 
-- Reply to comments on this week's videos (real replies, not generic — these massively boost algorithmic reach)
-- Reply to the top 5 comments on your most-recent video on each platform
-- Note any audience question that could become a future video topic
-- Add to `Channel\content_calendar.md`
+### Flip-night touch (~10 min, HARD CAP)
 
-(Or, if you can't sustain Saturday work: batch all engagement into 30 min on Sunday morning.)
+*(Added 2026-06-09 weekly review, PU-1 / R3 lever 1, Manager C1 folded. Runs **each flip evening** — every night a scheduled video flips public, ~7:00–7:45 PM ET after the 6:35 slot. It supplements the Saturday block below; it does not replace it.)*
+
+Each flip evening, for that night's flipped video(s):
+
+1. **Pin the PINNED COMMENT.** Post the video's staged `PINNED COMMENT:` text (from its metadata bundle) in YouTube Studio and pin it — day-of, not 6 days later.
+2. **Quick reply pass.** First-pass replies to whatever genuine comments have already landed on tonight's and recent videos. Quick, real, specific — not the deep Saturday pass.
+3. **Citation-upgrade audit — night N−1's videos.** Check whether yesterday's published videos got their 24h third-party citation upgrade (a day-of video can't have its 24h upgrade verified at publish, so flip-night N audits night N−1). Tick the result in the log.
+4. **Log a row in the treatment log** — `C:\ContentOps\channels\ShadowVerse\01_research\_engagement_log.csv` (`topic_id, video_id, flip_date, pinned, reply_pass, citation_upgrade_checked, notes`). One row per flipped video, every flip night. **Skipped steps get logged too, with the reason in `notes`** — a skipped night with a reason beats a silent gap.
+
+Rules:
+- **10 minutes per night, HARD CAP.** Pin + log + citation tick fit inside it. Reply overflow defers to the existing Saturday top-N triage below — no second SOP.
+- **Pin-only fallback:** if comments stay at 0 for 4 consecutive weeks, the reply pass downgrades to pin-only until PU-6 instrumentation shows volume.
+
+### Saturday block (unchanged)
+
+**Per-video engagement SOP** (run for each video published this week, inside the 30–45 min block):
+
+1. **PIN your own first comment.** Post the channel's own first comment using the `PINNED COMMENT:` text from that video's metadata bundle (the single non-URL friend-voice line posing the script's stakes-tied closing question), then pin it. This seeds the conversation with the question we *want* answered and anchors the comment section before anyone else lands.
+2. **Reply — with a volume off-ramp.** While comments are sparse (under ~15/week across the channel), reply to **~100%** of genuine comments — every real reply is high-leverage for early-stage algorithmic reach. As volume grows past that, switch to **top-N triage**: reply to the highest-signal handful per video (questions, strong reactions, named regulars) and let low-signal "nice" comments go. Keep the whole pass inside the 30–45 min Saturday block; don't let it sprawl.
+3. **Log genuine viewer questions to the topic inbox.** Any comment that's a real question or a latent video idea → capture it in the topic inbox (`Channel\content_calendar.md`) so it can seed a future video. The pinned closing-question is designed to manufacture exactly these.
+
+Notes:
+- Replies must be real and specific, never generic — that's what boosts reach.
+- (Or, if you can't sustain Saturday work: batch all engagement into 30 min on Sunday morning.)
 
 ---
 

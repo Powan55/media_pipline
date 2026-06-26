@@ -41,7 +41,7 @@ from typing import Callable
 
 import requests
 
-from pipeline import load_config, setup_logging
+from pipeline import load_config, setup_logging, validate_config
 
 log = logging.getLogger("trend_pull")
 
@@ -60,6 +60,36 @@ NICHE_KEYWORDS: tuple[str, ...] = (
     "ai coding", "ai assistant", "ai ide", "ai agent",
     "prompt engineering", "tool use", "agent framework",
     "rag", "embedding", "vector db", "fine-tune", "fine tuning",
+)
+
+# General-tech track keywords (dual-track slot, 2026-06-21) — used to filter HN
+# top stories down to broad consumer-tech relevance (Apple/Meta/Microsoft/Tesla/
+# Neuralink/gadgets) for the general-tech track. Same matcher as NICHE_KEYWORDS
+# (word-bounded substring-on-title, lowercased). Deliberately broad: the operator
+# chose full general-tech scope, and AI-adjacent consumer tech (Apple Intelligence,
+# Copilot) is welcome here too. The crazy-tech-story LEAD genre is sourced via the
+# news-RSS queue + tavily-in-loop (start.md), NOT HN keyword matching.
+GENERAL_TECH_KEYWORDS: tuple[str, ...] = (
+    # Apple
+    "apple", "iphone", "ipad", "macbook", "mac", "ios", "ipados", "macos",
+    "siri", "vision pro", "airpods", "apple watch", "apple intelligence",
+    # Google / Android
+    "google", "pixel", "android", "chromebook",
+    # Microsoft / Windows
+    "microsoft", "windows", "surface", "xbox", "copilot",
+    # Meta
+    "meta", "quest", "oculus", "ray-ban", "instagram", "whatsapp", "threads",
+    # Tesla / Musk / Neuralink / SpaceX
+    "tesla", "elon", "musk", "neuralink", "spacex", "starlink", "cybertruck", "robotaxi",
+    # Other hardware makers / silicon
+    "samsung", "galaxy", "sony", "playstation", "nintendo", "nvidia", "amd",
+    "intel", "qualcomm", "snapdragon",
+    # Consumer-tech platforms / giants
+    "amazon", "alexa", "echo", "ring", "netflix", "spotify", "tiktok", "uber",
+    # Generic consumer-tech signals
+    "smartphone", "smartwatch", "smart glasses", "ar glasses", "vr headset",
+    "wearable", "gadget", "robot", "drone", "self-driving", "electric car",
+    "chip", "processor", "battery", "foldable",
 )
 
 # GitHub repos to track for new releases. (repo, niche-tag) — niche-tag flows into
@@ -137,9 +167,18 @@ def pull_github_releases(repo: str, tag: str, *, limit: int = 5) -> list[TrendCa
 # Hacker News top stories (Firebase API, no auth)
 # -----------------------------------------------------------------------------
 
-def pull_hacker_news(*, scan_top: int = 60, max_keep: int = 25) -> list[TrendCandidate]:
-    """Scan HN top-story IDs, keep ones whose title matches a niche keyword."""
-    log.info("hacker news top (scan_top=%d, keep<=%d)", scan_top, max_keep)
+def pull_hacker_news(
+    *,
+    scan_top: int = 60,
+    max_keep: int = 25,
+    keywords: tuple[str, ...] = NICHE_KEYWORDS,
+) -> list[TrendCandidate]:
+    """Scan HN top-story IDs, keep ones whose title matches a `keywords` entry.
+
+    `keywords` defaults to the AI-vendor NICHE_KEYWORDS; the general-tech track
+    passes GENERAL_TECH_KEYWORDS instead.
+    """
+    log.info("hacker news top (scan_top=%d, keep<=%d, keywords=%d)", scan_top, max_keep, len(keywords))
     top_ids = _http_get(
         "https://hacker-news.firebaseio.com/v0/topstories.json",
         accept="application/json",
@@ -163,7 +202,7 @@ def pull_hacker_news(*, scan_top: int = 60, max_keep: int = 25) -> list[TrendCan
         # Word-boundary match so "zed" doesn't match inside "authoriZED",
         # "uv" doesn't match inside "discover", "cline" doesn't match inside "decline", etc.
         matched = next(
-            (kw for kw in NICHE_KEYWORDS
+            (kw for kw in keywords
              if re.search(rf"(?:^|\W){re.escape(kw)}(?:\W|$)", title_lower)),
             None,
         )
@@ -310,51 +349,154 @@ def pull_google_trends(terms: list[str], geo: str = "") -> list[TrendCandidate]:
 
 
 # -----------------------------------------------------------------------------
+# News-RSS queue ingestion (reads tools/news_rss_poller.py's queue file)
+# -----------------------------------------------------------------------------
+
+DEFAULT_NEWS_QUEUE_NAME = "news_drops_queue.json"
+
+
+def pull_news_rss_queue(
+    queue_path: Path,
+    *,
+    track: str = "ai-vendor",
+    max_keep: int = 25,
+) -> list[TrendCandidate]:
+    """Surface queued news-RSS drops for `track` as TrendCandidates.
+
+    Reads the queue file written by tools/news_rss_poller.py (NEVER fetches the
+    network here — the poller owns fetching, on its own scheduled cadence). Filters
+    to the requested track; drops written before the track field existed default to
+    'ai-vendor'. A missing/unreadable/malformed queue yields [] (fail-soft, mirrors
+    the rest of trend_pull's per-source isolation).
+    """
+    if not queue_path.exists():
+        log.info("news-rss queue: %s absent — 0 candidates", queue_path)
+        return []
+    try:
+        raw = json.loads(queue_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("news-rss queue unreadable (%s) — 0 candidates", e)
+        return []
+    if not isinstance(raw, list):
+        log.warning("news-rss queue not a list — 0 candidates")
+        return []
+    out: list[TrendCandidate] = []
+    for drop in raw:
+        if not isinstance(drop, dict):
+            continue
+        if str(drop.get("track", "ai-vendor")) != track:
+            continue
+        url = str(drop.get("url", "")).strip()
+        title = str(drop.get("title", "")).strip()
+        if not url or not title:
+            continue
+        out.append(TrendCandidate(
+            source=f"news_rss:{drop.get('feed', 'unknown')}",
+            url=url,
+            title=title,
+            summary=str(drop.get("summary", ""))[:500],
+            surfaced_at=datetime.now(timezone.utc).isoformat(),
+            published_at=drop.get("published_at"),
+            score=None,
+            tag=str(drop.get("feed", "news")),
+            extra={"news_drop_id": drop.get("id"), "track": track},
+        ))
+        if len(out) >= max_keep:
+            break
+    log.info("news-rss queue: %d candidates for track=%s", len(out), track)
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Orchestration
 # -----------------------------------------------------------------------------
 
-def pull_all(out_dir: Path, *, dry_run: bool = False) -> tuple[Path | None, list[TrendCandidate]]:
-    """Run every wired source in turn. Failures are logged and skipped.
+def pull_all(
+    out_dir: Path,
+    *,
+    dry_run: bool = False,
+    track: str = "ai-vendor",
+) -> tuple[Path | None, list[TrendCandidate]]:
+    """Run the wired sources for `track` in turn. Failures are logged and skipped.
+
+    track='ai-vendor' (default): GitHub dev-AI releases + Cursor changelog + HN
+    (AI niche keywords) + Reddit stub — byte-identical to the pre-dual-track flow.
+    track='general-tech': HN (general-tech keywords) + the news-RSS queue
+    (general-tech drops). The general-tech artifact is written to a track-suffixed
+    filename so a same-day ai-vendor pull is never clobbered.
 
     Returns (artifact_path or None if dry_run, candidates list).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     candidates: list[TrendCandidate] = []
+    # Track real (non-stub) sources we actually attempted vs the subset that
+    # raised a hard failure, so we can distinguish "every source failed"
+    # (degraded — operator must act) from "sources ran but matched nothing"
+    # (benign empty day). NotImplementedError stubs are SKIPs, not attempts.
+    attempted: list[str] = []
+    failed: list[str] = []
 
     def _safe(name: str, fn: Callable[[], list[TrendCandidate]]) -> None:
         try:
             results = fn()
-            log.info("%s: %d candidates", name, len(results))
-            candidates.extend(results)
         except NotImplementedError as e:
             log.info("%s: SKIPPED (stub) — %s", name, e.args[0] if e.args else "not implemented")
+            return
         except Exception as e:
+            attempted.append(name)
+            failed.append(name)
             log.warning("%s: FAILED — %s", name, e)
+            return
+        attempted.append(name)
+        log.info("%s: %d candidates", name, len(results))
+        candidates.extend(results)
 
-    # GitHub releases
-    for repo, tag in TRACKED_GITHUB_REPOS:
-        _safe(f"github:{repo}", lambda r=repo, t=tag: pull_github_releases(r, t))
+    if track == "ai-vendor":
+        # GitHub releases
+        for repo, tag in TRACKED_GITHUB_REPOS:
+            _safe(f"github:{repo}", lambda r=repo, t=tag: pull_github_releases(r, t))
 
-    # Vendor changelogs
-    _safe("cursor:changelog", pull_cursor_changelog)
+        # Vendor changelogs
+        _safe("cursor:changelog", pull_cursor_changelog)
 
-    # Hacker News
-    _safe("hn", pull_hacker_news)
+        # Hacker News
+        _safe("hn", pull_hacker_news)
 
-    # Stubs — these will log SKIPPED until wired
-    reddit_id = os.environ.get("REDDIT_CLIENT_ID", "").strip()
-    reddit_secret = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
-    if reddit_id and reddit_secret:
-        ua = os.environ.get("REDDIT_USER_AGENT", USER_AGENT)
-        # When wired, the body of pull_reddit_top will replace the stub
-        _safe("reddit", lambda: pull_reddit_top(
-            reddit_id, reddit_secret, ua,
-            ["LocalLLaMA", "MachineLearning", "ChatGPTCoding", "cursor", "ClaudeAI", "programming"],
+        # Stubs — these will log SKIPPED until wired
+        reddit_id = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+        reddit_secret = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+        if reddit_id and reddit_secret:
+            ua = os.environ.get("REDDIT_USER_AGENT", USER_AGENT)
+            # When wired, the body of pull_reddit_top will replace the stub
+            _safe("reddit", lambda: pull_reddit_top(
+                reddit_id, reddit_secret, ua,
+                ["LocalLLaMA", "MachineLearning", "ChatGPTCoding", "cursor", "ClaudeAI", "programming"],
+            ))
+        else:
+            log.info("reddit: SKIPPED (no REDDIT_CLIENT_ID/SECRET in env)")
+    elif track == "general-tech":
+        # General-tech track: broad consumer-tech HN scan + the news-RSS queue
+        # (the dev-AI GitHub repos and Cursor changelog are off-topic here).
+        _safe("hn", lambda: pull_hacker_news(keywords=GENERAL_TECH_KEYWORDS))
+        _safe("news_rss", lambda: pull_news_rss_queue(
+            out_dir / DEFAULT_NEWS_QUEUE_NAME, track="general-tech",
         ))
     else:
-        log.info("reddit: SKIPPED (no REDDIT_CLIENT_ID/SECRET in env)")
+        raise ValueError(
+            f"unknown track {track!r}; expected 'ai-vendor' or 'general-tech'"
+        )
 
-    if not candidates:
+    if attempted and len(failed) == len(attempted):
+        # Every real source raised — the pull is fully degraded and the artifact
+        # will be empty for an infrastructure reason, not a quiet news day.
+        # Escalate to ERROR so an unattended run surfaces it loudly; still write
+        # the artifact below (downstream tolerates empty).
+        log.error(
+            "trend_pull: ALL %d sources failed (%s) — artifact will be empty/degraded; check network",
+            len(attempted),
+            ", ".join(failed),
+        )
+    elif not candidates:
         log.warning("trend_pull produced 0 candidates — check network / source coverage")
 
     # De-duplicate on URL
@@ -378,7 +520,10 @@ def pull_all(out_dir: Path, *, dry_run: bool = False) -> tuple[Path | None, list
         return None, deduped
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    out_path = out_dir / f"trends_{today}.json"
+    # ai-vendor keeps the historical trends_<date>.json name (back-compat); other
+    # tracks are suffixed so a same-day pull of one track never clobbers the other.
+    name = f"trends_{today}.json" if track == "ai-vendor" else f"trends_{track}_{today}.json"
+    out_path = out_dir / name
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     log.info("wrote %s (%d candidates, %d dupes dropped)",
              out_path, len(deduped), len(candidates) - len(deduped))
@@ -389,16 +534,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Daily trend pull for ShadowVerse")
     parser.add_argument("--dry-run", action="store_true", help="Pull but don't write the artifact")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
+    parser.add_argument(
+        "--track",
+        default="ai-vendor",
+        choices=["ai-vendor", "general-tech"],
+        help="Topic track to pull. 'general-tech' uses consumer-tech HN keywords + the news-RSS queue.",
+    )
     args = parser.parse_args(argv)
 
     config = load_config(Path(args.config) if args.config else None)
+    validate_config(config)  # M4: fail fast on missing keys before any stage runs
     run_id = "trend_" + datetime.now().strftime("%Y%m%dT%H%M%S")
     setup_logging(config, run_id)
 
     channel_root = Path(config["paths"]["channel_root"])
     out_dir = channel_root / "01_research"
 
-    pull_all(out_dir, dry_run=args.dry_run)
+    pull_all(out_dir, dry_run=args.dry_run, track=args.track)
     return 0
 
 

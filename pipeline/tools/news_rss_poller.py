@@ -45,6 +45,7 @@ import argparse
 import json
 import logging
 import os
+import socket
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -64,8 +65,10 @@ DEFAULT_QUEUE_PATH = DEFAULT_CHANNEL_RESEARCH / "news_drops_queue.json"
 DEFAULT_SEEN_PATH = DEFAULT_CHANNEL_RESEARCH / "news_drops_seen.json"
 DEFAULT_LOG_PATH = DEFAULT_CHANNEL_RESEARCH / "news_rss_poller.log"
 
-# Fetch timeout passed to feedparser via the underlying urllib opener. Keep this
-# generous — feed servers occasionally take a few seconds to render.
+# Fetch timeout for feed requests. feedparser exposes no timeout= kwarg, so we
+# apply this via the process-wide default socket timeout around parse() (see
+# fetch_feed: save/restore in finally). Keep this generous — feed servers
+# occasionally take a few seconds to render.
 HTTP_TIMEOUT_S = 30
 
 # Truncate entry summaries before persisting. Keeps the queue file small and
@@ -102,6 +105,39 @@ FEEDS: dict[str, tuple[str, str]] = {
     ),
 }
 
+# General-tech track feeds (broad consumer-tech + viral-old fills, added
+# 2026-06-21 for the dual-track slot). These surface fresh device / product / OS
+# news (iPhone / Meta / Windows / Tesla / gadgets) that the AI-vendor feeds above
+# never carry. The crazy-tech-story LEAD genre is sourced SEPARATELY via tavily-in-
+# the-apex-loop (human-interest stories won't cluster in RSS) — see start.md.
+# Whether these are polled at all is gated by config
+# (news_rss.general_tech_feeds_enabled) at the ORCHESTRATION layer (start.md /
+# scheduled task); this module stays config-free and is driven by the --track
+# flag. Reddit's .rss endpoint needs no API key. URLs to re-verify live on first
+# run (RSS endpoints drift / occasionally go JS-only — the poller degrades
+# gracefully via bozo + per-feed isolation).
+GENERAL_TECH_FEEDS: dict[str, tuple[str, str]] = {
+    "theverge": ("The Verge", "https://www.theverge.com/rss/index.xml"),
+    "9to5mac": ("9to5Mac", "https://9to5mac.com/feed/"),
+    "engadget": ("Engadget", "https://www.engadget.com/rss.xml"),
+    "arstechnica": ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    "reddit_technology": (
+        "r/technology (top/day)",
+        "https://www.reddit.com/r/technology/top/.rss?t=day",
+    ),
+    "reddit_gadgets": (
+        "r/gadgets (top/day)",
+        "https://www.reddit.com/r/gadgets/top/.rss?t=day",
+    ),
+}
+
+# Track → feed-registry map. The CLI --track flag and callers select via this.
+# An unknown track key would KeyError at the call site — intentional fail-loud.
+FEEDS_BY_TRACK: dict[str, dict[str, tuple[str, str]]] = {
+    "ai-vendor": FEEDS,
+    "general-tech": GENERAL_TECH_FEEDS,
+}
+
 
 # -----------------------------------------------------------------------------
 # Data model
@@ -118,12 +154,13 @@ class NewsDrop:
     """
 
     id: str                       # entry.id with entry.link fallback (dedup key)
-    feed: str                     # feed_key: "anthropic" | "openai" | "google"
+    feed: str                     # feed_key: "anthropic" | "openai" | "theverge" | ...
     title: str
     url: str
     published_at: str             # ISO 8601, parsed from entry.published if present
     summary: str                  # truncated to SUMMARY_MAX_CHARS
     added_to_queue_at: str        # ISO 8601 of when this script appended it
+    track: str = "ai-vendor"      # "ai-vendor" | "general-tech" — consumers filter by this
     extra: dict = field(default_factory=dict)
 
 
@@ -292,11 +329,21 @@ def fetch_feed(feed_key: str, feed_url: str) -> list[dict]:
     rest of the poll.
     """
     log.info("fetch %s: %s", feed_key, feed_url)
-    parsed = feedparser.parse(
-        feed_url,
-        agent=USER_AGENT,
-        request_headers={"User-Agent": USER_AGENT},
-    )
+    # feedparser has no timeout= kwarg; it uses urllib under the hood, which
+    # honors the process-wide default socket timeout. Set it around the parse
+    # call and restore the prior default in finally so a stalled feed server
+    # can't hang the fetch indefinitely and we don't leak a global timeout into
+    # the rest of the process.
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(HTTP_TIMEOUT_S)
+    try:
+        parsed = feedparser.parse(
+            feed_url,
+            agent=USER_AGENT,
+            request_headers={"User-Agent": USER_AGENT},
+        )
+    finally:
+        socket.setdefaulttimeout(prev_timeout)
     # feedparser sets .bozo=1 when the feed is malformed; it still returns
     # whatever entries it managed to parse, so we treat bozo as a warning,
     # not a hard failure.
@@ -312,10 +359,14 @@ def entries_to_drops(
     feed_key: str,
     entries: Iterable[dict],
     seen: dict[str, str],
+    *,
+    track: str = "ai-vendor",
 ) -> list[NewsDrop]:
     """Filter feed entries through the seen-set, materialize NewsDrops.
 
     Mutates `seen` — adds each accepted entry's id with the now() timestamp.
+    `track` tags each drop so the shared queue is consumable per-track downstream
+    (defaults "ai-vendor" so existing positional callers are unchanged).
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     drops: list[NewsDrop] = []
@@ -339,6 +390,7 @@ def entries_to_drops(
             published_at=_entry_published_iso(entry),
             summary=_entry_summary(entry),
             added_to_queue_at=now_iso,
+            track=track,
         )
         drops.append(drop)
         seen[eid] = now_iso
@@ -357,11 +409,14 @@ def poll_once(
     queue_path: Path,
     seen_path: Path,
     max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
+    track: str = "ai-vendor",
 ) -> list[NewsDrop]:
     """Poll all `feeds` once, append new entries to the queue, update seen-set.
 
     Returns the list of NewsDrops appended this run. Per-feed failures log a
-    WARNING and skip — they do not raise out.
+    WARNING and skip — they do not raise out. `track` tags every drop produced
+    this run (defaults "ai-vendor"); two sequential per-track polls share one
+    queue file and append their own track-tagged drops.
     """
     seen = load_seen(seen_path)
     seen = prune_seen(seen, max_age_hours)
@@ -379,7 +434,7 @@ def poll_once(
             log.warning("%s (%s): FETCH FAILED — %s", feed_key, display_name, e)
             continue
         try:
-            drops = entries_to_drops(feed_key, entries, seen)
+            drops = entries_to_drops(feed_key, entries, seen, track=track)
         except Exception as e:  # noqa: BLE001
             log.warning("%s (%s): PARSE FAILED — %s", feed_key, display_name, e)
             continue
@@ -412,20 +467,23 @@ def poll_once(
 # -----------------------------------------------------------------------------
 
 
-def _parse_feeds_arg(arg: str | None) -> dict[str, tuple[str, str]]:
-    """Resolve --feeds CSV to a dict of selected feeds. None = all."""
+def _parse_feeds_arg(
+    arg: str | None,
+    registry: dict[str, tuple[str, str]] = FEEDS,
+) -> dict[str, tuple[str, str]]:
+    """Resolve --feeds CSV to a dict of selected feeds. None = all in `registry`."""
     if not arg:
-        return dict(FEEDS)
+        return dict(registry)
     keys = [k.strip().lower() for k in arg.split(",") if k.strip()]
     selected: dict[str, tuple[str, str]] = {}
     for k in keys:
-        if k not in FEEDS:
+        if k not in registry:
             raise SystemExit(
-                f"Unknown feed key: {k!r}. Available: {sorted(FEEDS)}"
+                f"Unknown feed key: {k!r}. Available: {sorted(registry)}"
             )
-        selected[k] = FEEDS[k]
+        selected[k] = registry[k]
     if not selected:
-        return dict(FEEDS)
+        return dict(registry)
     return selected
 
 
@@ -439,9 +497,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Poll all selected feeds once and exit. Required for scheduled-task use.",
     )
     parser.add_argument(
+        "--track",
+        default="ai-vendor",
+        choices=sorted(FEEDS_BY_TRACK),
+        help=(
+            "Which feed registry to poll and tag drops with. "
+            "'ai-vendor' (default): anthropic,openai,google. "
+            "'general-tech': theverge,9to5mac,engadget,arstechnica,reddit_technology,reddit_gadgets."
+        ),
+    )
+    parser.add_argument(
         "--feeds",
         default=None,
-        help="CSV of feed keys to poll. Default: all. Available: anthropic,openai,google",
+        help="CSV of feed keys to poll within the selected --track. Default: all in that track.",
     )
     parser.add_argument(
         "--queue",
@@ -475,8 +543,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--once is required (this tool runs as a scheduled-task one-shot).")
 
     setup_logging(Path(args.log_path))
-    log.info("news_rss_poller start (once)")
-    feeds = _parse_feeds_arg(args.feeds)
+    log.info("news_rss_poller start (once, track=%s)", args.track)
+    registry = FEEDS_BY_TRACK[args.track]
+    feeds = _parse_feeds_arg(args.feeds, registry)
     log.info("polling feeds: %s", sorted(feeds))
 
     poll_once(
@@ -484,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         queue_path=Path(args.queue),
         seen_path=Path(args.seen),
         max_age_hours=args.max_age_hours,
+        track=args.track,
     )
     log.info("news_rss_poller done")
     return 0

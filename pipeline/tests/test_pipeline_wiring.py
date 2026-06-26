@@ -176,5 +176,65 @@ def test_pipeline_qa_failed_reused_from_tools() -> None:
     assert issubclass(PipelineQAFailed, live_pipeline.PipelineHalted)
 
 
+# ---------------------------------------------------------------------------
+# PU-2 (2026-05-29): PINNED COMMENT metadata section
+# ---------------------------------------------------------------------------
+
+
+_METADATA_RESPONSE_BASE = (
+    "YOUTUBE SHORTS:\n"
+    "Title: Claude AI pretended to be the internet\n"
+    "Description: A wild AI story. It tried something nobody expected. AI-assisted.\n"
+    "#Shorts #AI #Claude #Anthropic #AInews #AItools #OpenAI #Gemini #TechNews\n"
+    "Tags: claude, ai, anthropic, ai news, chatgpt, gemini, openai, ai tools, future tech, tech news\n"
+    "\n"
+    "TIKTOK:\n"
+    "Caption: Claude pretended to be the internet. Wild. Would you trust it?\n"
+    "Hashtags: #TechTok #AI #Claude #AInews\n"
+    "\n"
+    "INSTAGRAM REELS:\n"
+    "Caption: Claude did something nobody expected this week. AI-assisted.\n"
+    "Hashtags: #AI #Claude #Anthropic #TechNews #ArtificialIntelligence\n"
+    "\n"
+    "COVER / THUMBNAIL CONCEPT:\n"
+    "Pattern: big_text_claim\n"
+    "Text overlay: IT FAKED THE WEB\n"
+    "Background: dark slate with a glitchy browser window\n"
+    "Accent color: #7C5CFF\n"
+)
+
+
+def test_metadata_pinned_comment_parsed_and_does_not_pollute_cover() -> None:
+    """PU-2: a `PINNED COMMENT:` section is extracted into MetadataBundle.pinned_comment,
+    a leading bullet is stripped, and — critically — it does NOT bleed into the
+    COVER accent field (the failure mode before PINNED COMMENT became a recognized
+    section boundary in _METADATA_SECTION_RE).
+    """
+    import pipeline
+
+    resp = _METADATA_RESPONSE_BASE + (
+        "\nPINNED COMMENT:\n"
+        "- So, would you actually trust an AI that can fake the whole internet? Yes or no?\n"
+    )
+    mb = pipeline._parse_metadata_response(resp, "2026-05-29_001")
+    assert mb.pinned_comment.startswith("So, would you actually trust")
+    assert not mb.pinned_comment.startswith("-"), "leading bullet not stripped"
+    # The accent field stays locked / unpolluted.
+    assert mb.cover_color_accent == "#7C5CFF"
+
+
+def test_metadata_without_pinned_comment_is_legacy_safe() -> None:
+    """A metadata response with NO PINNED COMMENT section must still parse, with
+    pinned_comment defaulting to '' and all required sections intact.
+    """
+    import pipeline
+
+    mb = pipeline._parse_metadata_response(_METADATA_RESPONSE_BASE, "2026-05-29_002")
+    assert mb.pinned_comment == ""
+    assert mb.cover_color_accent == "#7C5CFF"
+    assert mb.youtube_title == "Claude AI pretended to be the internet"
+    assert mb.cover_pattern_name == "big_text_claim"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

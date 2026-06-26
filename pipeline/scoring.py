@@ -64,6 +64,31 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 
 WEIGHTS_PATH = Path(__file__).resolve().parent / "scoring_weights.json"
 
+# Per-track scoring-weights profiles. The ai-vendor track uses the default
+# scoring_weights.json; the general-tech track (broad consumer-tech + crazy-story
+# slot, added 2026-06-21) uses a profile that lowers niche_fit (the AI-niche
+# accessibility rubric doesn't apply) and raises hook_strength / verifiability /
+# broll_feasibility (hook quality, fact-checkability of human-interest claims, and
+# stock-footage availability for product/people shots all matter more here).
+GENERAL_TECH_WEIGHTS_PATH = Path(__file__).resolve().parent / "scoring_weights_general_tech.json"
+
+_TRACK_WEIGHTS_PATHS: dict[str, Path] = {
+    "ai-vendor": WEIGHTS_PATH,
+    "general-tech": GENERAL_TECH_WEIGHTS_PATH,
+}
+
+
+def weights_path_for_track(track: str = "ai-vendor") -> Path:
+    """Return the scoring-weights JSON path for a track.
+
+    Unknown track falls back to the ai-vendor default (fail-soft, mirroring
+    load_weights' behavior on a missing/invalid file). The general-tech profile
+    is created in Phase 1; if it is absent on disk, load_weights() returns
+    DEFAULT_WEIGHTS, so a missing profile degrades to ai-vendor weights rather
+    than crashing.
+    """
+    return _TRACK_WEIGHTS_PATHS.get(track, WEIGHTS_PATH)
+
 
 # Counter-conventional framing produces an additive bonus on top of the weighted-component
 # sum. Capped at _COUNTER_CONVENTIONAL_BONUS so it nudges ranking without overriding the
@@ -301,6 +326,158 @@ def _named_human_bonus(*texts: str) -> float:
     return 0.0
 
 
+# High-salience NAMED-ENTITY anchor bonus (2026-06-24 analytics deep-dive). The
+# title-anchor lever is the strongest measured REACH signal in the learning ledger
+# (anchored titles ~1.75x the median views of unanchored, n=50) and EVERY video
+# that has ever cleared the breakout ceiling carries one. `_ai_vendor_bonus` already
+# rewards AI-vendor anchors, but it (a) misses big CONSUMER-TECH entities
+# (Apple/iPhone/Tesla/Neuralink/Windows/Meta...) that the general-tech track exists
+# to surface, and (b) is SUPPRESSED entirely on the general-tech track — leaving
+# that track with no entity reward at all. This bonus fills exactly that gap. Its
+# lexicon is DISJOINT from `_AI_VENDOR_PATTERNS` (so the SAME entity is never
+# double-counted), it is TRACK-AGNOSTIC (fires on both tracks — the whole point is
+# to reward Tesla/Apple/Neuralink on the general-tech slot), and it is damped on
+# FINANCIAL-deal topics alongside its siblings. Set just below the 0.05 siblings
+# because it can legitimately co-occur with _ai_vendor_bonus on a dual-entity topic
+# (e.g. "Apple's Siri runs on Gemini").
+_HIGH_SALIENCE_ANCHOR_BONUS: float = 0.04
+
+# Consumer-tech entities NOT covered by _AI_VENDOR_PATTERNS. Word-bounded,
+# case-insensitive, single combined alternation (one match fires the cap).
+_HIGH_SALIENCE_ANCHOR_PATTERNS: list[re.Pattern] = [
+    re.compile(
+        r"\b(?:"
+        # Apple ecosystem
+        r"Apple|iPhone|iPad|iPod|iOS|macOS|MacBook|Mac|Siri|AirPods|AirTag|"
+        r"Vision\s+Pro|Apple\s+Watch|Apple\s+Vision"
+        # Big tech (non-AI-vendor standalone names)
+        r"|Microsoft|Windows|Xbox|Surface"
+        r"|Amazon|Alexa|Echo|Kindle|AWS"
+        r"|Meta|Facebook|Instagram|WhatsApp|Threads|Quest|Oculus"
+        r"|Samsung|Galaxy"
+        r"|Sony|PlayStation|Nintendo|Switch"
+        # Chips / hardware
+        r"|Nvidia|Intel|AMD|Qualcomm|Snapdragon|TSMC|ARM"
+        # Musk-verse hardware (the protagonist names are handled by _named_human_bonus)
+        r"|Tesla|SpaceX|Starlink|Neuralink"
+        # Robotics / auto / drones / wearables / space
+        r"|Boston\s+Dynamics|Waymo|Rivian|Cybertruck|Roomba|iRobot"
+        r"|GoPro|DJI|Garmin|Ring\s+doorbell|Dyson"
+        r"|NASA|Blue\s+Origin|Boeing"
+        # Major consumer platforms / devices commonly anchoring tech stories
+        r"|Android|Pixel|Chrome|Chromebook|YouTube|TikTok|Snapchat|Spotify|Netflix"
+        r")\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _high_salience_anchor_bonus(*texts: str) -> float:
+    """Return _HIGH_SALIENCE_ANCHOR_BONUS if any input names a high-salience
+    consumer-tech entity (disjoint from the AI-vendor lexicon).
+
+    Joins all non-empty inputs into one blob and runs the combined pattern. One
+    match is enough; multiple don't compound. Returns 0.0 when nothing fires.
+    Inputs are typically (topic, angle, hook_concept).
+    """
+    blob = " ".join(t for t in texts if t)
+    for pattern in _HIGH_SALIENCE_ANCHOR_PATTERNS:
+        if pattern.search(blob):
+            return _HIGH_SALIENCE_ANCHOR_BONUS
+    return 0.0
+
+
+# Corporate-FINANCE-deal damp (2026-06-11 sweep, CODE_AUDIT item (d)). Footgun: a
+# dead-floor corporate-finance topic (e.g. an OpenAI S-1 / IPO) bonus-stacked the
+# ai_vendor + named_human bonuses (it names a vendor AND a CEO) and floated to
+# rank-2 despite the consumer-AI dead floor (mean 155 views). This DAMPS those two
+# bonuses and applies a small flat penalty when FINANCIAL deal language is present.
+#
+# Detection is FINANCIAL-deal language ONLY. It deliberately does NOT match generic
+# collaboration words ("partnership", "deal", "built around", "powered by") so that
+# legitimate product/architecture stories that merely involve two companies are
+# left UNTOUCHED. Two regression anchors that MUST score unchanged:
+#   - "Apple reveals new AI architecture built around Google Gemini" (a legit
+#     1.045-score rank-1 pick — "built around" is collaboration, not finance)
+#   - "Apple's new Siri secretly runs on Google's Gemini"
+# Both contain no IPO / funding / valuation / acquisition / investor language.
+#
+# Tuning lives in NEW keys in scoring_weights.json (corporate_deal_bonus_damp,
+# corporate_deal_penalty) — these sit OUTSIDE the 8 normalized component weights
+# (load_weights ignores non-DEFAULT_WEIGHTS keys, exactly like the existing _doc /
+# _tuning_history meta-keys), so the PU-10 governance HOLD on the component numbers
+# is untouched and the runtime sum-to-1.0 normalization is unaffected.
+DEFAULT_CORPORATE_DEAL_BONUS_DAMP: float = 0.25   # multiply ai_vendor + named_human bonuses by this on a hit
+DEFAULT_CORPORATE_DEAL_PENALTY: float = 0.10      # flat amount subtracted from weighted_total on a hit
+
+_CORPORATE_DEAL_PATTERNS: list[re.Pattern] = [
+    # Public-offering / filing language.
+    re.compile(r"\bIPO\b", re.IGNORECASE),
+    re.compile(r"\bS-1\b", re.IGNORECASE),
+    re.compile(r"\bSPAC\b", re.IGNORECASE),
+    # Fundraising language. "funding round", "raises/raised $...", "Series A".."Series F".
+    re.compile(r"\bfunding\s+round\b", re.IGNORECASE),
+    re.compile(r"\brais(?:e|es|ed|ing)\s+\$", re.IGNORECASE),
+    re.compile(r"\bseries\s+[A-F]\b", re.IGNORECASE),
+    # Valuation / investor language.
+    re.compile(r"\bvaluation\b", re.IGNORECASE),
+    re.compile(r"\binvestors?\b", re.IGNORECASE),
+    # M&A language. Plural-aware ("acquisition"/"acquisitions", "acquire"/"acquires"),
+    # case-insensitive. Word boundaries keep "requisition" from matching.
+    re.compile(r"\bacquisitions?\b", re.IGNORECASE),
+    re.compile(r"\bacquires?\b", re.IGNORECASE),
+    re.compile(r"\bmergers?\b", re.IGNORECASE),
+]
+
+
+def _is_corporate_deal(*texts: str) -> bool:
+    """True if any input carries FINANCIAL corporate-deal language.
+
+    Joins all non-empty inputs into one blob and runs each financial-deal pattern.
+    Matches ONLY finance signals (IPO / S-1 / funding round / raises $ / valuation /
+    acquisition / merger / SPAC / series A-F / investors). Does NOT match generic
+    collaboration words ("partnership", "deal", "built around", "powered by").
+    Inputs are typically (topic, angle, hook_concept).
+    """
+    blob = " ".join(t for t in texts if t)
+    for pattern in _CORPORATE_DEAL_PATTERNS:
+        if pattern.search(blob):
+            return True
+    return False
+
+
+def load_corporate_deal_tuning(path: Path = WEIGHTS_PATH) -> tuple[float, float]:
+    """Load (bonus_damp, penalty) for the corporate-deal damp from scoring_weights.json.
+
+    Reads the NEW non-component keys `corporate_deal_bonus_damp` and
+    `corporate_deal_penalty`. These live alongside the existing meta-keys (_doc,
+    _tuning_history) and are NOT part of the normalized 8-component weight set, so
+    load_weights() never sees them and the PU-10 HOLD is untouched. Missing/invalid
+    values fall back to the module defaults. Returns the defaults if the file is
+    absent or unreadable (mirrors load_weights' fail-soft behavior).
+    """
+    damp = DEFAULT_CORPORATE_DEAL_BONUS_DAMP
+    penalty = DEFAULT_CORPORATE_DEAL_PENALTY
+    if not path.exists():
+        return damp, penalty
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("corporate-deal tuning unreadable (%s); using defaults", e)
+        return damp, penalty
+    if "corporate_deal_bonus_damp" in raw:
+        try:
+            damp = float(raw["corporate_deal_bonus_damp"])
+        except (TypeError, ValueError):
+            log.warning("corporate_deal_bonus_damp not float-coercible; using default %.3f", damp)
+    if "corporate_deal_penalty" in raw:
+        try:
+            penalty = float(raw["corporate_deal_penalty"])
+        except (TypeError, ValueError):
+            log.warning("corporate_deal_penalty not float-coercible; using default %.3f", penalty)
+    return damp, penalty
+
+
 @dataclass
 class ScoreComponents:
     """The 8 component scores, each in 0.0..1.0. Field order = ranking display order."""
@@ -340,6 +517,9 @@ class ScoredCandidate:
     counter_conventional_bonus: float = 0.0
     ai_vendor_bonus: float = 0.0
     named_human_bonus: float = 0.0
+    high_salience_anchor_bonus: float = 0.0  # consumer-tech named-entity anchor (2026-06-24)
+    corporate_deal_damped: bool = False      # True when FINANCIAL-deal language damped the bonuses + applied a penalty
+    corporate_deal_penalty: float = 0.0      # flat penalty actually subtracted (0.0 when no hit)
     weighted_total: float = 0.0
     rationale: str = ""
 
@@ -380,16 +560,29 @@ def score_topic(components: ScoreComponents, weights: dict[str, float] | None = 
     return sum(getattr(c, k) * weights[k] for k in weights)
 
 
-def rank_candidates(candidates: list[dict], weights: dict[str, float] | None = None) -> list[ScoredCandidate]:
+def rank_candidates(
+    candidates: list[dict],
+    weights: dict[str, float] | None = None,
+    *,
+    suppress_ai_vendor_bonus: bool = False,
+) -> list[ScoredCandidate]:
     """Score and rank a list of candidate dicts (as produced by 02_idea_generation.md).
 
     Each candidate dict must have keys: topic, angle, hook_concept, scores (a dict of
     the 8 component scores). Optional: why_now, audience, source_indexes,
     cited_observation_candidate, rationale.
 
+    `suppress_ai_vendor_bonus` zeroes the +0.05 AI-vendor bonus for this batch —
+    set True for the general-tech track (broad consumer-tech + crazy-story slot),
+    where rewarding AI-vendor mentions would bias against the very topics the track
+    exists to surface (iPhone/Meta/Windows/Tesla/Neuralink). Defaults False, so the
+    ai-vendor track and every existing caller are unchanged. The counter-conventional
+    and named-human bonuses are track-agnostic and always apply.
+
     Returns ScoredCandidates sorted descending by weighted_total.
     """
     w = weights or load_weights()
+    cd_damp, cd_penalty = load_corporate_deal_tuning()
     out: list[ScoredCandidate] = []
     for raw in candidates:
         scores = raw.get("scores") or {}
@@ -400,7 +593,7 @@ def rank_candidates(candidates: list[dict], weights: dict[str, float] | None = N
             raw.get("angle", ""),
             raw.get("hook_concept", ""),
         )
-        ai_bonus = _ai_vendor_bonus(
+        ai_bonus = 0.0 if suppress_ai_vendor_bonus else _ai_vendor_bonus(
             raw.get("topic", ""),
             raw.get("angle", ""),
             raw.get("hook_concept", ""),
@@ -414,7 +607,29 @@ def rank_candidates(candidates: list[dict], weights: dict[str, float] | None = N
             str(cited.get("summary", "")),
             str(cited.get("retrievable_quote", "")),
         )
-        total = base + cc_bonus + ai_bonus + nh_bonus
+        hs_bonus = _high_salience_anchor_bonus(
+            raw.get("topic", ""),
+            raw.get("angle", ""),
+            raw.get("hook_concept", ""),
+        )
+        # Corporate-FINANCE-deal damp: a press-release-style finance topic that names
+        # a vendor + a human can farm ai_vendor + named_human bonuses to float above
+        # the dead floor. When FINANCIAL deal language is present, damp BOTH bonuses
+        # and subtract a flat penalty; floor the total at 0. counter_conventional is
+        # left intact (a finance topic with a genuine contrarian twist keeps it).
+        is_deal = _is_corporate_deal(
+            raw.get("topic", ""),
+            raw.get("angle", ""),
+            raw.get("hook_concept", ""),
+        )
+        applied_penalty = 0.0
+        if is_deal:
+            ai_bonus *= cd_damp
+            nh_bonus *= cd_damp
+            hs_bonus *= cd_damp
+            applied_penalty = cd_penalty
+        total = base + cc_bonus + ai_bonus + nh_bonus + hs_bonus - applied_penalty
+        total = max(0.0, total)  # floor at 0
         out.append(ScoredCandidate(
             topic=raw.get("topic", ""),
             angle=raw.get("angle", ""),
@@ -427,6 +642,9 @@ def rank_candidates(candidates: list[dict], weights: dict[str, float] | None = N
             counter_conventional_bonus=cc_bonus,
             ai_vendor_bonus=ai_bonus,
             named_human_bonus=nh_bonus,
+            high_salience_anchor_bonus=hs_bonus,
+            corporate_deal_damped=is_deal,
+            corporate_deal_penalty=applied_penalty,
             weighted_total=round(total, 4),
             rationale=raw.get("rationale", ""),
         ))
@@ -434,9 +652,17 @@ def rank_candidates(candidates: list[dict], weights: dict[str, float] | None = N
     return out
 
 
-def pick_top_n(candidates: list[dict], n: int, weights: dict[str, float] | None = None) -> list[ScoredCandidate]:
+def pick_top_n(
+    candidates: list[dict],
+    n: int,
+    weights: dict[str, float] | None = None,
+    *,
+    suppress_ai_vendor_bonus: bool = False,
+) -> list[ScoredCandidate]:
     """Convenience: rank + take top n."""
-    return rank_candidates(candidates, weights)[:n]
+    return rank_candidates(
+        candidates, weights, suppress_ai_vendor_bonus=suppress_ai_vendor_bonus
+    )[:n]
 
 
 # -----------------------------------------------------------------------------

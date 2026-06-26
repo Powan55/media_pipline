@@ -308,5 +308,109 @@ class AllocationResultDataclassTests(unittest.TestCase):
         self.assertIsNone(r.topic_id)
 
 
+# ---------------------------------------------------------------------------
+# Item 3 (2026-05-22): picks_assignment.json corruption — fail-loud + orphan rescue
+# ---------------------------------------------------------------------------
+
+
+from daily_batch import (  # noqa: E402
+    PicksAssignmentCorrupted,
+    _scan_for_orphaned_topic_ids,
+)
+
+
+class PicksAssignmentCorruptHaltsTests(unittest.TestCase):
+    """The fail-loud upgrade: a malformed picks_assignment.json must raise
+    PicksAssignmentCorrupted, log at ERROR (not WARNING), and write a
+    postmortem stub markdown file — instead of silently returning {} and
+    orphaning yesterday's script work on the next batch run."""
+
+    def test_load_picks_assignment_corrupt_file_halts(self):
+        with _TempEnv() as (channel_root, daily_dir):
+            # Write malformed JSON — opening brace then garbage, no closing brace.
+            (daily_dir / "picks_assignment.json").write_text(
+                "{not valid json", encoding="utf-8",
+            )
+
+            with self.assertLogs("daily_batch", level="ERROR") as captured:
+                with self.assertRaises(PicksAssignmentCorrupted) as ctx:
+                    _load_picks_assignment(daily_dir, channel_root=channel_root)
+
+            # ERROR (not WARNING) log emitted.
+            self.assertTrue(
+                any(
+                    "unreadable" in r.getMessage().lower()
+                    and r.levelname == "ERROR"
+                    for r in captured.records
+                ),
+                f"expected ERROR log mentioning 'unreadable', got: "
+                f"{[(r.levelname, r.getMessage()) for r in captured.records]}",
+            )
+
+            # Postmortem stub was written.
+            self.assertIsNotNone(ctx.exception.postmortem_path)
+            pm_path = ctx.exception.postmortem_path
+            self.assertTrue(pm_path.exists())
+            content = pm_path.read_text(encoding="utf-8")
+            self.assertIn("picks_assignment.json corruption", content)
+            # Truncated corrupted contents preserved.
+            self.assertIn("not valid json", content)
+            # Exception type identified.
+            self.assertIn("JSONDecodeError", content)
+
+
+class OrphanScannerTests(unittest.TestCase):
+    """Tests for daily_batch._scan_for_orphaned_topic_ids."""
+
+    def test_orphan_scanner_finds_drafted_topic_ids(self):
+        with _TempEnv() as (channel_root, daily_dir):
+            drafts = channel_root / "02_scripts" / "_drafts"
+            topic_dir = drafts / "2026-05-22_001"
+            topic_dir.mkdir(parents=True)
+            (topic_dir / "script_RESPONSE.txt").write_text(
+                "## SCRIPT_BODY\nReal script content the operator wrote.\n",
+                encoding="utf-8",
+            )
+
+            orphans = _scan_for_orphaned_topic_ids(channel_root, "2026-05-22")
+            self.assertEqual(orphans, ["2026-05-22_001"])
+
+    def test_orphan_scanner_skips_empty_drafts(self):
+        """A topic_id dir with an empty (or missing) script_RESPONSE.txt is
+        NOT an orphan — there's no real script work to rescue."""
+        with _TempEnv() as (channel_root, daily_dir):
+            drafts = channel_root / "02_scripts" / "_drafts"
+            # Dir A: empty script_RESPONSE.txt.
+            (drafts / "2026-05-22_001").mkdir(parents=True)
+            (drafts / "2026-05-22_001" / "script_RESPONSE.txt").write_text(
+                "", encoding="utf-8",
+            )
+            # Dir B: no script_RESPONSE.txt at all.
+            (drafts / "2026-05-22_002").mkdir(parents=True)
+
+            orphans = _scan_for_orphaned_topic_ids(channel_root, "2026-05-22")
+            self.assertEqual(orphans, [])
+
+    def test_orphan_scanner_filters_by_daily_date(self):
+        """Only topic_ids matching the requested daily_date prefix are returned."""
+        with _TempEnv() as (channel_root, daily_dir):
+            drafts = channel_root / "02_scripts" / "_drafts"
+            # Today's orphan.
+            today_dir = drafts / "2026-05-22_001"
+            today_dir.mkdir(parents=True)
+            (today_dir / "script_RESPONSE.txt").write_text(
+                "today content", encoding="utf-8",
+            )
+            # Yesterday's drafted dir — must NOT show in today's orphan list.
+            yesterday_dir = drafts / "2026-05-21_001"
+            yesterday_dir.mkdir(parents=True)
+            (yesterday_dir / "script_RESPONSE.txt").write_text(
+                "yesterday content", encoding="utf-8",
+            )
+
+            orphans = _scan_for_orphaned_topic_ids(channel_root, "2026-05-22")
+            self.assertEqual(orphans, ["2026-05-22_001"])
+
+
 if __name__ == "__main__":
     unittest.main()

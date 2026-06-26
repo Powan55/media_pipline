@@ -13,6 +13,12 @@ credentials/*
 # --- Local config (template only is committed) ---
 config.yaml
 config.local.yaml
+# dated/manual config backups (e.g. config.2026-05-30_003.yaml) — never commit
+config.*.yaml
+# learning-loop auto-revert snapshot of config.yaml (runtime artifact)
+*.learning.bak
+# transient run markers (e.g. .run_start_tmp.txt)
+.run_*.txt
 
 # --- Logs and runtime artifacts ---
 # Ignore everything inside logs/ EXCEPT the .gitkeep that preserves the dir itself.

@@ -140,6 +140,49 @@ def test_error_message_includes_claim_text() -> None:
 
 
 # ---------------------------------------------------------------------------
+# WORKFLOW_AUDIT_2026-05-31 H2 — empty Claim cell raises (phantom-row guard)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_claim_cell_raises() -> None:
+    """A row with a non-empty Status but an EMPTY Claim cell is a phantom row.
+
+    It survives the full-empty-row skip (the Status/URL cells are populated) and
+    the literal-'claim'-header skip, so without the H2 guard it would append a
+    FactClaim with claim_text='' and inflate the gate-2 unresolved count. The
+    parser must raise a ValueError naming the Claim cell + the producer artifact.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _parse_factcheck_response(_table("VERIFIED", claim_text=""), topic_id="t1")
+    msg = str(excinfo.value)
+    assert "Claim" in msg
+    assert "factcheck_RESPONSE.txt" in msg
+
+
+@pytest.mark.parametrize("blank_claim", [" ", "   ", '""', '" "', '   "   "  '])
+def test_whitespace_or_quote_only_claim_raises(blank_claim: str) -> None:
+    """A claim cell that is only whitespace and/or quote chars normalizes to
+    empty (same way FactClaim normalizes claim_text) and must also raise — not
+    sneak through as a blank-named claim."""
+    with pytest.raises(ValueError) as excinfo:
+        _parse_factcheck_response(_table("VERIFIED", claim_text=blank_claim), topic_id="t1")
+    assert "Claim" in str(excinfo.value)
+
+
+def test_nonempty_claim_still_parses_after_h2() -> None:
+    """Regression guard: H2's raise must not break the happy path. A normal
+    non-empty claim still parses to exactly one FactClaim (mirrors
+    test_canonical_status_still_parses)."""
+    report = _parse_factcheck_response(
+        _table("VERIFIED", claim_text="Anthropic 25% emotional-support figure"),
+        topic_id="t1",
+    )
+    assert len(report.claims) == 1
+    assert report.claims[0].status == "VERIFIED"
+    assert report.claims[0].claim_text == "Anthropic 25% emotional-support figure"
+
+
+# ---------------------------------------------------------------------------
 # Audit M3 — Tool column (tavily / web / none / unknown legacy fallback)
 # ---------------------------------------------------------------------------
 
@@ -273,3 +316,84 @@ def test_cycle9_factcheck_5col_legacy_still_parses(tmp_path) -> None:
     assert len(report.claims) == 3
     # All rows fall back to unknown since the Tool column was absent.
     assert all(c.tool_used == "unknown" for c in report.claims)
+
+
+# ---------------------------------------------------------------------------
+# WORKFLOW_AUDIT_2026-05-31 L2 — a detected header that leaves a REQUIRED
+# column unmapped must fail loud instead of silently using a positional default.
+# ---------------------------------------------------------------------------
+
+
+def test_header_present_but_required_column_unmapped_raises() -> None:
+    """A header IS detected (separator row present), but Status is labelled with
+    a non-alias (`Verdict-Code`) so it fails to classify. Without L2 the Status
+    column would silently retain its positional default and parse the WRONG cell;
+    the parser must instead raise a ValueError naming the unmapped column and the
+    producer artifact.
+    """
+    response = (
+        "| Claim | Verdict-Code | URL | Quote | Fix |\n"
+        "|-------|--------------|-----|-------|-----|\n"
+        "| Anthropic 25% figure | VERIFIED | https://example.com | \"q\" | (n/a) |\n"
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _parse_factcheck_response(response, topic_id="t1")
+    msg = str(excinfo.value)
+    # Names the unmapped required column...
+    assert "status" in msg
+    # ...echoes the header cells the parser saw...
+    assert "Verdict-Code" in msg
+    # ...and points the operator at the producer artifact to re-run.
+    assert "factcheck_RESPONSE.txt" in msg
+
+
+@pytest.mark.parametrize(
+    "bad_header, missing",
+    [
+        # Claim mislabelled (no "claim" substring) -> claim unmapped.
+        ("| Assertion | Status | Source URL | Quote | Fix |", "claim"),
+        # URL mislabelled (not url/link/source) -> url unmapped.
+        ("| Claim | Status | Reference | Quote | Fix |", "url"),
+    ],
+)
+def test_other_unmappable_required_columns_raise(bad_header: str, missing: str) -> None:
+    """Symmetric coverage: a mislabelled Claim or URL header column also raises."""
+    sep = "|" + "|".join(["---"] * (bad_header.count("|") - 1)) + "|"
+    response = (
+        f"{bad_header}\n{sep}\n"
+        "| Anthropic 25% figure | VERIFIED | https://example.com | \"q\" | (n/a) |\n"
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _parse_factcheck_response(response, topic_id="t1")
+    assert missing in str(excinfo.value)
+    assert "factcheck_RESPONSE.txt" in str(excinfo.value)
+
+
+def test_canonical_header_still_parses_after_l2() -> None:
+    """Regression: a standard header maps claim/status/url cleanly, so the L2
+    raise never fires and the row parses normally."""
+    report = _parse_factcheck_response(_table("VERIFIED"), topic_id="t1")
+    assert len(report.claims) == 1
+    assert report.claims[0].status == "VERIFIED"
+
+
+def test_six_col_canonical_header_still_parses_after_l2() -> None:
+    """Regression: the 6-column M3 header (with the optional Tool column) maps
+    all required columns and parses without tripping the L2 raise."""
+    report = _parse_factcheck_response(_table_6("VERIFIED", "tavily"), topic_id="t1")
+    assert len(report.claims) == 1
+    assert report.claims[0].tool_used == "tavily"
+
+
+def test_legacy_no_header_positional_table_unaffected_by_l2() -> None:
+    """Regression: a table with NO header row (no separator) hits the strict
+    positional 5-column default path (header_idx is None). The L2 raise fires
+    ONLY when a header is detected, so this legacy shape must still parse."""
+    no_header = (
+        "| Anthropic 25% figure | VERIFIED | https://example.com | \"q\" | (n/a) |\n"
+        "| ChatGPT trained on data | UNCLEAR | https://example.com | \"q\" | fix it |\n"
+    )
+    report = _parse_factcheck_response(no_header, topic_id="t1")
+    assert len(report.claims) == 2
+    assert report.claims[0].status == "VERIFIED"
+    assert report.claims[1].status == "UNCLEAR"

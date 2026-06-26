@@ -43,8 +43,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 
+import httplib2
 import yaml
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
@@ -58,6 +60,7 @@ from hook_selection_log import (  # noqa: E402  — sys.path bootstrap above
 )
 from tools.archive_published import archive_topic  # noqa: E402
 from tools.oauth_token_helpers import (  # noqa: E402
+    _FIX_COMMAND_POINTER,
     log_token_expiry_health,
     refresh_with_translation,
 )
@@ -84,6 +87,24 @@ ALLOWED_PRIVACY = ("public", "unlisted", "private")
 MAX_TITLE_CHARS = 100
 MAX_DESC_CHARS = 5000
 
+# M2 (WORKFLOW_AUDIT_2026-05-31): resilience knobs for the Data API calls.
+# num_retries → googleapiclient's built-in exponential backoff on transient
+# 5xx/socket errors; the transport socket timeout is what actually prevents an
+# unattended /start -auto upload hanging forever on a stalled connection
+# (.execute()/next_chunk() have NO timeout= kwarg). Both rely on already-installed
+# deps (google-api-python-client / google-auth-httplib2 / httplib2) — no new dep.
+YT_API_NUM_RETRIES = 3
+YT_API_TIMEOUT_S = 60  # uploads stream large bodies; allow a longer wall-clock than analytics
+
+
+def _timeout_http(creds: Credentials) -> AuthorizedHttp:
+    """Authorized httplib2 transport with a wall-clock socket timeout.
+
+    Pass as ``build(..., http=_timeout_http(creds))`` INSTEAD of
+    ``credentials=creds`` (mutually exclusive — AuthorizedHttp carries creds).
+    """
+    return AuthorizedHttp(creds, http=httplib2.Http(timeout=YT_API_TIMEOUT_S))
+
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -108,6 +129,17 @@ def load_credentials() -> Credentials:
         )
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
     log_token_expiry_health(creds, logger=log)
+    # M3 (WORKFLOW_AUDIT_2026-05-31): a token can be structurally valid yet carry
+    # the WRONG scopes (e.g. minted before yt-analytics.readonly was added). Without
+    # this pre-check that surfaces ONLY later as an untranslated HTTP 403
+    # insufficientPermissions deep inside an API call. Convert it to the same
+    # actionable load-time message the refresh path already uses. has_scopes() is a
+    # pure read on the scopes google-auth already parsed — no re-implementation.
+    if not creds.has_scopes(SCOPES):
+        raise RuntimeError(
+            "OAuth token is missing one or more required scopes "
+            f"({', '.join(SCOPES)}). {_FIX_COMMAND_POINTER}"
+        )
     if creds.expired and creds.refresh_token:
         refresh_with_translation(creds, token_path=TOKEN_PATH, logger=log)
     if not creds.valid:
@@ -239,7 +271,15 @@ def upload_video(youtube, video_path: Path, snippet: dict, status: dict) -> str:
     )
     media = MediaFileUpload(
         str(video_path),
-        chunksize=10 * 1024 * 1024,  # 10 MiB chunks
+        # chunksize=-1 uploads the whole file in a SINGLE request instead of
+        # multiple 10 MiB chunks. The chunked resumable path triggers httplib2
+        # `RedirectMissingLocation` on an inter-chunk 308 redirect, which errors
+        # client-side AFTER the server has created a 0-duration broken video
+        # (root cause of the 2026-06-19/20 duplicate/0-duration incident, which
+        # was misattributed to concurrency). Single-shot avoids the inter-chunk
+        # redirect entirely; safe for the channel's small (<50 MB) Shorts.
+        # (fix 2026-06-20)
+        chunksize=-1,
         resumable=True,
         mimetype="video/mp4",
     )
@@ -252,7 +292,10 @@ def upload_video(youtube, video_path: Path, snippet: dict, status: dict) -> str:
     response = None
     last_logged_progress = 0.0
     while response is None:
-        chunk_status, response = request.next_chunk()
+        # M2: num_retries gives each resumable chunk built-in backoff on transient
+        # failures; combined with the transport timeout this stops a stalled upload
+        # hanging an unattended run.
+        chunk_status, response = request.next_chunk(num_retries=YT_API_NUM_RETRIES)
         if chunk_status is not None:
             progress = chunk_status.progress()
             # Log every 10% to keep stdout sane on tiny + huge files.
@@ -270,15 +313,47 @@ def set_thumbnail(youtube, video_id: str, thumbnail_path: Path) -> None:
     log.info("setting thumbnail for video %s — %s (%.1f KB)",
              video_id, thumbnail_path.name, size_kb)
     media = MediaFileUpload(str(thumbnail_path), mimetype="image/png", resumable=False)
-    youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+    youtube.thumbnails().set(
+        videoId=video_id, media_body=media
+    ).execute(num_retries=YT_API_NUM_RETRIES)
+
+
+def _upload_log_path(config: dict) -> Path:
+    """Canonical path to the append-only upload audit log."""
+    return Path(config["paths"]["channel_root"]) / "01_research" / "upload_log.csv"
+
+
+def _find_existing_upload(config: dict, topic_id: str) -> dict | None:
+    """Return the most recent upload_log.csv row for topic_id, or None.
+
+    The pre-insert idempotency guard (H-1): a re-invoked uploader (resumable
+    chunk-timeout retry, exit-3 confusion, manual re-run) would otherwise call
+    videos().insert a second time and create a DUPLICATE scheduled video. This
+    reads the same append-only log append_upload_log writes.
+
+    Fail-soft toward ALLOWING the upload: a missing log means no prior upload; an
+    unreadable log logs a WARNING and returns None. The guard must never BLOCK a
+    legitimate first upload because the local log couldn't be read — the real
+    risk it defends against (re-invoke after a successful write) always has a
+    readable, freshly-written log.
+    """
+    log_path = _upload_log_path(config)
+    if not log_path.exists():
+        return None
+    try:
+        with log_path.open("r", encoding="utf-8", newline="") as f:
+            matches = [r for r in csv.DictReader(f) if r.get("topic_id") == topic_id]
+    except OSError as e:
+        log.warning("idempotency check: could not read %s (%s) — allowing upload", log_path, e)
+        return None
+    return matches[-1] if matches else None
 
 
 def append_upload_log(
     config: dict, topic_id: str, video_id: str, privacy: str, title: str
 ) -> Path:
     """Record the upload in 01_research/upload_log.csv (append-only audit)."""
-    channel_root = Path(config["paths"]["channel_root"])
-    log_path = channel_root / "01_research" / "upload_log.csv"
+    log_path = _upload_log_path(config)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     new_file = not log_path.exists()
@@ -388,7 +463,7 @@ def _run_post_upload_hooks(
         return
 
     channel_root = Path(config["paths"]["channel_root"])
-    project_root = Path(r"C:\Users\laxmi\Documents\Project")
+    project_root = Path(config["paths"]["project_root"])
 
     try:
         archived_paths = archive_topic(
@@ -460,6 +535,13 @@ def main(argv: list[str] | None = None) -> int:
              "Default behavior is to auto-append the operator's hook choice after a "
              "successful upload; this flag is a debugging escape hatch.",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Override the idempotency guard: upload even if upload_log.csv already "
+             "has a row for this topic_id (e.g. the prior upload was deleted). Default "
+             "is to skip as a no-op so a re-invoked upload can't create a duplicate "
+             "scheduled video.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -496,8 +578,36 @@ def main(argv: list[str] | None = None) -> int:
         log.info("--dry-run: skipping upload")
         return 0
 
+    # Idempotency guard (H-1): never double-publish. A prior upload of this
+    # topic_id is recorded in upload_log.csv; re-invoking the uploader would
+    # otherwise create a duplicate scheduled video. Skip as a no-op unless --force.
+    if not args.force:
+        existing = _find_existing_upload(config, args.topic_id)
+        if existing is not None:
+            existing_id = existing.get("video_id", "")
+            existing_url = existing.get("url") or f"https://www.youtube.com/watch?v={existing_id}"
+            log.warning(
+                "topic %s already uploaded (video_id=%s, privacy=%s, at %s) per %s — "
+                "skipping to avoid a duplicate. Re-run with --force to upload anyway.",
+                args.topic_id, existing_id, existing.get("privacy"),
+                existing.get("uploaded_at"), _upload_log_path(config),
+            )
+            print()
+            print("=" * 60)
+            print("Upload skipped — topic already uploaded (idempotency guard)")
+            print(f"  topic_id:  {args.topic_id}")
+            print(f"  video_id:  {existing_id}")
+            print(f"  url:       {existing_url}")
+            print(f"  uploaded:  {existing.get('uploaded_at')}")
+            print("  (re-run with --force to upload again)")
+            print("=" * 60)
+            return 0
+
     creds = load_credentials()
-    youtube = build("youtube", "v3", credentials=creds)
+    # M2: timeout'd authorized transport (http=) instead of credentials= so a
+    # stalled socket can't hang the unattended upload. AuthorizedHttp carries the
+    # creds, so credentials= must NOT also be passed (mutually exclusive).
+    youtube = build("youtube", "v3", http=_timeout_http(creds))
 
     try:
         video_id = upload_video(youtube, video_path, snippet, status)

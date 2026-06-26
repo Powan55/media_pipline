@@ -23,7 +23,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools import news_rss_poller as poller  # noqa: E402
 from tools.news_rss_poller import (  # noqa: E402
+    FEEDS,
+    FEEDS_BY_TRACK,
+    GENERAL_TECH_FEEDS,
     NewsDrop,
+    _parse_feeds_arg,
     entries_to_drops,
     load_seen,
     poll_once,
@@ -363,3 +367,178 @@ def test_summary_truncation():
     assert len(drops) == 1
     assert len(drops[0].summary) <= poller.SUMMARY_MAX_CHARS
     assert drops[0].summary.endswith("...")
+
+
+# ---------------------------------------------------------------------------
+# Test 9 (L6): fetch_feed applies HTTP_TIMEOUT_S via the default socket timeout
+# and restores the prior default afterward (even though parse succeeds).
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_feed_sets_socket_timeout(monkeypatch):
+    """fetch_feed must set the default socket timeout to HTTP_TIMEOUT_S while
+    feedparser.parse runs, then restore the prior default in finally."""
+    import socket as _socket
+
+    sentinel_prior = 7.5  # a distinctive prior default to prove restore
+    _socket.setdefaulttimeout(sentinel_prior)
+
+    # `real` is the genuine setter, captured before we patch — the spy delegates
+    # to it so the OS default actually moves and fetch_feed sees real values.
+    real_setdefaulttimeout = _socket.setdefaulttimeout
+    set_calls: list[float | None] = []
+
+    def spy_set(value):
+        set_calls.append(value)
+        return real_setdefaulttimeout(value)
+
+    # Stub parse: record the live default timeout at the moment parse runs.
+    timeout_at_parse: dict[str, float | None] = {}
+
+    def fake_parse(url, **_kwargs):
+        timeout_at_parse["value"] = _socket.getdefaulttimeout()
+        return _fake_parsed([_entry(eid="op-1", title="One")])
+
+    monkeypatch.setattr(poller.socket, "setdefaulttimeout", spy_set)
+    monkeypatch.setattr(poller.feedparser, "parse", fake_parse)
+
+    entries = poller.fetch_feed("openai", "https://openai.com/news/rss.xml")
+
+    # parse saw HTTP_TIMEOUT_S as the live default (wiring proven).
+    assert timeout_at_parse["value"] == poller.HTTP_TIMEOUT_S
+    # fetch_feed set HTTP_TIMEOUT_S, then restored the prior default — exactly
+    # two setter calls, in that order (the spy is still installed here, so we
+    # assert before any cleanup goes through it).
+    assert set_calls == [poller.HTTP_TIMEOUT_S, sentinel_prior]
+    # And the live default really is back to the prior value (finally-restore).
+    assert _socket.getdefaulttimeout() == sentinel_prior
+    # Sanity: fetch_feed still returns the parsed entries.
+    assert len(entries) == 1
+
+    # Cleanup: clear the global default without routing through the spy.
+    real_setdefaulttimeout(None)
+
+
+def test_fetch_feed_restores_socket_timeout_on_error(monkeypatch):
+    """If feedparser.parse raises, the prior default socket timeout is still
+    restored via the finally block (no global-timeout leak)."""
+    import socket as _socket
+
+    saved_default = _socket.getdefaulttimeout()
+    sentinel_prior = 3.0
+    _socket.setdefaulttimeout(sentinel_prior)
+
+    def boom_parse(url, **_kwargs):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(poller.feedparser, "parse", boom_parse)
+
+    try:
+        with pytest.raises(OSError):
+            poller.fetch_feed("anthropic", "https://example.com/anthropic.xml")
+        assert _socket.getdefaulttimeout() == sentinel_prior, (
+            "prior default must be restored even when parse raises"
+        )
+    finally:
+        _socket.setdefaulttimeout(saved_default)
+
+
+# ---------------------------------------------------------------------------
+# Test 10 (dual-track, 2026-06-21): general-tech feed registry + track tagging
+# ---------------------------------------------------------------------------
+
+
+def test_track_defaults_to_ai_vendor():
+    """entries_to_drops with no track tags drops 'ai-vendor' (back-compat)."""
+    seen: dict[str, str] = {}
+    drops = entries_to_drops("openai", [_entry(eid="op-1")], seen)
+    assert drops[0].track == "ai-vendor"
+
+
+def test_entries_to_drops_tags_general_tech_track():
+    """Explicit track='general-tech' is stamped on each drop."""
+    seen: dict[str, str] = {}
+    drops = entries_to_drops(
+        "theverge", [_entry(eid="tv-1", title="New iPhone feature")], seen,
+        track="general-tech",
+    )
+    assert len(drops) == 1
+    assert drops[0].track == "general-tech"
+    assert drops[0].feed == "theverge"
+
+
+def test_poll_once_general_tech_tags_queue_entries(tmp_path, monkeypatch):
+    """poll_once(track='general-tech') writes track onto the queued dicts."""
+    queue_path = tmp_path / "queue.json"
+    seen_path = tmp_path / "seen.json"
+    poller.setup_logging(tmp_path / "poller.log")
+
+    _patch_feedparser(
+        monkeypatch,
+        {"theverge.com": [_entry(eid="tv-1", title="Meta changed its glasses")]},
+    )
+
+    drops = poll_once(
+        feeds={"theverge": ("The Verge", "https://www.theverge.com/rss/index.xml")},
+        queue_path=queue_path,
+        seen_path=seen_path,
+        max_age_hours=168,
+        track="general-tech",
+    )
+    assert len(drops) == 1 and drops[0].track == "general-tech"
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert queue[0]["track"] == "general-tech"
+    # All original required fields still present (no regression).
+    for required in ("id", "feed", "title", "url", "published_at", "summary", "added_to_queue_at"):
+        assert required in queue[0]
+
+
+def test_two_track_polls_share_one_queue(tmp_path, monkeypatch):
+    """Sequential ai-vendor then general-tech polls append to one queue, each
+    drop tagged with its own track."""
+    queue_path = tmp_path / "queue.json"
+    seen_path = tmp_path / "seen.json"
+    poller.setup_logging(tmp_path / "poller.log")
+
+    _patch_feedparser(
+        monkeypatch,
+        {
+            "openai.com": [_entry(eid="op-1", title="OpenAI shipped")],
+            "engadget.com": [_entry(eid="eg-1", title="New gadget drops")],
+        },
+    )
+
+    poll_once(
+        feeds={"openai": ("OpenAI", "https://openai.com/news/rss.xml")},
+        queue_path=queue_path, seen_path=seen_path, max_age_hours=168,
+        track="ai-vendor",
+    )
+    poll_once(
+        feeds={"engadget": ("Engadget", "https://www.engadget.com/rss.xml")},
+        queue_path=queue_path, seen_path=seen_path, max_age_hours=168,
+        track="general-tech",
+    )
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    by_track = {q["track"]: q for q in queue}
+    assert by_track["ai-vendor"]["feed"] == "openai"
+    assert by_track["general-tech"]["feed"] == "engadget"
+
+
+def test_feeds_by_track_registry_shape():
+    """The two-track registry maps cleanly and general-tech carries the planned feeds."""
+    assert FEEDS_BY_TRACK["ai-vendor"] is FEEDS
+    assert FEEDS_BY_TRACK["general-tech"] is GENERAL_TECH_FEEDS
+    # Each value is (display_name, url) and every general-tech feed is a real URL.
+    for key, (name, url) in GENERAL_TECH_FEEDS.items():
+        assert name and url.startswith("http"), f"bad feed entry {key!r}"
+    # The planned general-tech sources are present.
+    assert {"theverge", "engadget", "arstechnica"} <= set(GENERAL_TECH_FEEDS)
+
+
+def test_parse_feeds_arg_uses_general_tech_registry():
+    """--feeds resolves against the selected track's registry, not always FEEDS."""
+    selected = _parse_feeds_arg("theverge,engadget", GENERAL_TECH_FEEDS)
+    assert set(selected) == {"theverge", "engadget"}
+    # An ai-vendor key is unknown within the general-tech registry → hard error.
+    with pytest.raises(SystemExit):
+        _parse_feeds_arg("openai", GENERAL_TECH_FEEDS)

@@ -1,0 +1,14 @@
+{
+  "_doc": "General-tech track scoring weights (broad consumer-tech + crazy-story slot, added 2026-06-21). Loaded via scoring.load_weights(scoring.weights_path_for_track('general-tech')). vs the ai-vendor default in scoring_weights.json: niche_fit lowered (the general-consumer-AI accessibility rubric doesn't apply to general tech), hook_strength + verifiability + broll_feasibility raised (hook quality, fact-checkability of human-interest claims, and product/people stock availability matter more here), anti_cannibalization eased (general tech is a fresh, deep pool). The AI-vendor +0.05 bonus is suppressed for this track at the rank_candidates() call site (suppress_ai_vendor_bonus=True), NOT here. Keys must match scoring.DEFAULT_WEIGHTS exactly; sum is 1.0 and load_weights normalizes if it drifts.",
+  "_default_priors_set_at": "2026-06-21",
+  "_tuning_history": [],
+
+  "niche_fit": 0.10,
+  "hook_strength": 0.20,
+  "specificity": 0.18,
+  "trend_signal": 0.10,
+  "verifiability": 0.14,
+  "broll_feasibility": 0.12,
+  "observation_availability": 0.10,
+  "anti_cannibalization": 0.06
+}

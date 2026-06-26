@@ -251,5 +251,149 @@ class MediaIntegrityTests(unittest.TestCase):
         self.assertIn("error", payload)
 
 
+# ---------------------------------------------------------------------------
+# Item 1 (2026-05-22): NVENC silent-corruption defense — smoke-check + retry
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_ffmpeg_on_path(), "ffmpeg/ffprobe not on PATH")
+class DecodeSmokeCheckTests(unittest.TestCase):
+    """Direct unit tests on pipeline._decode_smoke_check()."""
+
+    tmp_root: Path
+    good_master: Path
+    truncated_master: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory(prefix="smoke_check_test_")
+        cls.tmp_root = Path(cls._tmpdir.name)
+        cls.good_master = _synthesize_good_master(cls.tmp_root / "good.mp4")
+        cls.truncated_master = cls.tmp_root / "truncated.mp4"
+        shutil.copy2(cls.good_master, cls.truncated_master)
+        # Truncate to ~6KB — keeps the moov box gone but leaves an mp4-shaped
+        # file ffmpeg will try (and fail) to decode.
+        _truncate(cls.truncated_master, 6 * 1024)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+
+    def test_smoke_decode_check_passes_on_known_good(self) -> None:
+        from pipeline import _decode_smoke_check
+        self.assertTrue(_decode_smoke_check(self.good_master))
+
+    def test_smoke_decode_check_fails_on_truncated(self) -> None:
+        from pipeline import _decode_smoke_check
+        self.assertFalse(_decode_smoke_check(self.truncated_master))
+
+    def test_smoke_decode_check_returns_false_for_missing_file(self) -> None:
+        from pipeline import _decode_smoke_check
+        self.assertFalse(_decode_smoke_check(self.tmp_root / "no_such.mp4"))
+
+
+@unittest.skipUnless(_ffmpeg_on_path(), "ffmpeg/ffprobe not on PATH")
+class RenderWithIntegrityRetryTests(unittest.TestCase):
+    """Tests for pipeline._render_with_integrity_retry() — the orchestrator
+    that retries render_master once with force_encoder="libx264" when Stage
+    10.1 (`_check_media_integrity`) rejects the master.
+
+    Strategy: monkeypatch `render_master` to return a truncated file on the
+    first call (force_encoder=None) and a good file on the second call
+    (force_encoder="libx264"). Assert that exactly one retry happens, the
+    final returned path is the good master, and the corrupted master is
+    preserved at <master>.nvenc-corrupt.mp4.
+    """
+
+    tmp_root: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory(prefix="render_retry_test_")
+        cls.tmp_root = Path(cls._tmpdir.name)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+
+    def test_corrupt_master_triggers_libx264_retry(self) -> None:
+        import pipeline
+
+        # Synthesize a good master and a truncated one. Both are placed at the
+        # same canonical "master path" — the second call (libx264 retry) will
+        # overwrite the truncated copy.
+        master_path = self.tmp_root / "topic_2026-05-22_001_master.mp4"
+        good_source = self.tmp_root / "good_source.mp4"
+        _synthesize_good_master(good_source)
+
+        # Pre-stage a truncated file at master_path for the first call.
+        shutil.copy2(good_source, master_path)
+        _truncate(master_path, 6 * 1024)
+
+        call_log: list[str | None] = []
+
+        def fake_render_master(*args, force_encoder=None, **kwargs):
+            call_log.append(force_encoder)
+            if force_encoder is None:
+                # First call — leave the truncated master in place.
+                assert master_path.exists() and master_path.stat().st_size < 10_000
+                return master_path
+            # Second call (libx264 retry) — replace with good content.
+            shutil.copy2(good_source, master_path)
+            return master_path
+
+        monkey = unittest.mock.patch.object(
+            pipeline, "render_master", side_effect=fake_render_master,
+        )
+        # We need to also patch _check_media_integrity to use low size threshold
+        # for the test fixture. The function calls tools.media_integrity.check_integrity.
+        # We'll patch _check_media_integrity directly to mimic the production behavior.
+        from tools.media_integrity import check_integrity, MediaIntegrityError
+
+        def fake_check_media_integrity(video_path: Path, *, stage: str) -> dict:
+            try:
+                return check_integrity(video_path, min_size_bytes=5_000)
+            except MediaIntegrityError as exc:
+                raise pipeline.IntegrityCheckFailed(
+                    video_path, str(exc), stage=stage,
+                ) from exc
+            except FileNotFoundError as exc:
+                raise pipeline.IntegrityCheckFailed(
+                    video_path, str(exc), stage=stage,
+                ) from exc
+
+        integrity_monkey = unittest.mock.patch.object(
+            pipeline, "_check_media_integrity",
+            side_effect=fake_check_media_integrity,
+        )
+
+        with monkey, integrity_monkey:
+            result = pipeline._render_with_integrity_retry(
+                script=None, assets=None,
+                vo_path=Path("/dev/null"), captions_path=Path("/dev/null"),
+                config={},
+            )
+
+        # Exactly two calls: first None, then "libx264".
+        self.assertEqual(call_log, [None, "libx264"])
+        # Final master exists and passes integrity.
+        self.assertEqual(result, master_path)
+        self.assertTrue(master_path.exists())
+        self.assertGreater(master_path.stat().st_size, 10_000)
+        # Corrupt master preserved for postmortem.
+        corrupt_path = master_path.with_suffix(
+            master_path.suffix + ".nvenc-corrupt.mp4",
+        )
+        self.assertTrue(
+            corrupt_path.exists(),
+            f"expected corrupt-master postmortem file at {corrupt_path}",
+        )
+
+
+# unittest.mock is imported lazily above to avoid a hard dep at module-load
+# time for users running individual tests via pytest's collection.
+import unittest.mock  # noqa: E402,F401
+
+
 if __name__ == "__main__":
     unittest.main()

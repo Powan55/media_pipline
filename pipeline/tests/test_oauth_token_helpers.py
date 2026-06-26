@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -153,20 +154,25 @@ class TestRefreshTranslation(unittest.TestCase):
         self.assertIsInstance(ctx.exception.__cause__, RefreshError)
 
     def test_successful_refresh_persists_token(self) -> None:
-        """On successful refresh, the helper must write the new JSON to disk."""
+        """On successful refresh, the helper persists the new JSON to disk atomically."""
         mock_creds = mock.MagicMock()
         mock_creds.refresh.return_value = None
         mock_creds.to_json.return_value = '{"token": "fresh"}'
 
-        with mock.patch.object(Path, "write_text") as m_write:
+        with tempfile.TemporaryDirectory() as td:
+            token_path = Path(td) / "token.json"
             oauth_token_helpers.refresh_with_translation(
                 mock_creds,
-                token_path=Path("token.json"),
+                token_path=token_path,
                 logger=logging.getLogger("oauth.test"),
             )
-
-        mock_creds.refresh.assert_called_once()
-        m_write.assert_called_once_with('{"token": "fresh"}', encoding="utf-8")
+            mock_creds.refresh.assert_called_once()
+            # Persisted atomically: final file holds the content, no .tmp sibling left.
+            self.assertEqual(token_path.read_text(encoding="utf-8"), '{"token": "fresh"}')
+            self.assertEqual(
+                list(Path(td).glob("token.json.*.tmp")), [],
+                "atomic write left a temp sibling behind",
+            )
 
     def test_refresh_error_logged_at_error_level(self) -> None:
         """The translated message should also fire at logging.ERROR so
@@ -188,6 +194,126 @@ class TestRefreshTranslation(unittest.TestCase):
             any("youtube_oauth_init.py --force" in r.getMessage() for r in error_records),
             f"error records were: {[r.getMessage() for r in error_records]}",
         )
+
+
+# ---------------------------------------------------------------------------
+# _atomic_write_text (M-10 / R2): atomic token persistence
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicWriteText(unittest.TestCase):
+    """The token write must be atomic (temp sibling + os.replace) so a concurrent
+    /start -auto sub-agent never reads a torn token."""
+
+    def test_writes_content_and_leaves_no_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "token.json"
+            oauth_token_helpers._atomic_write_text(target, '{"a": 1}')
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"a": 1}')
+            self.assertEqual(list(Path(td).glob("*.tmp")), [])
+
+    def test_overwrites_existing_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "token.json"
+            target.write_text("OLD", encoding="utf-8")
+            oauth_token_helpers._atomic_write_text(target, "NEW")
+            self.assertEqual(target.read_text(encoding="utf-8"), "NEW")
+            self.assertEqual(list(Path(td).glob("*.tmp")), [])
+
+    def test_failed_replace_cleans_temp(self) -> None:
+        """If os.replace fails, the temp sibling must not be left behind."""
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "token.json"
+            with mock.patch.object(
+                oauth_token_helpers.os, "replace", side_effect=OSError("boom")
+            ):
+                with self.assertRaises(OSError):
+                    oauth_token_helpers._atomic_write_text(target, "data")
+            self.assertEqual(list(Path(td).glob("*.tmp")), [])
+
+
+# ---------------------------------------------------------------------------
+# M3 (WORKFLOW_AUDIT_2026-05-31): wrong-scope-but-valid token pre-check
+# ---------------------------------------------------------------------------
+
+
+class TestWrongScopeToken(unittest.TestCase):
+    """A structurally-valid token carrying the WRONG scopes must raise an
+    actionable RuntimeError at LOAD time in BOTH credential-load paths
+    (tools/youtube_upload.load_credentials AND analytics_pull._load_credentials),
+    instead of surfacing later as an untranslated HTTP 403 insufficientPermissions.
+
+    The check uses `creds.has_scopes(SCOPES)`; the message reuses the shared
+    `_FIX_COMMAND_POINTER` (no forked wording). The refresh path is NOT exercised
+    here — a narrower-scope token short-circuits before refresh.
+    """
+
+    def _narrow_scope_creds(self):
+        """A creds stand-in that is otherwise valid but lacks a required scope.
+
+        `has_scopes(required)` returns False for the real SCOPES set, mirroring a
+        token minted before `yt-analytics.readonly` was added. `.valid` is True so
+        we prove the raise comes from the scope check, not the validity check.
+        """
+        creds = mock.MagicMock()
+        creds.has_scopes.return_value = False
+        creds.valid = True
+        creds.expired = False
+        # Give a REAL expiry so log_token_expiry_health (called before the scope
+        # check) can do its datetime math / format without a MagicMock blowing up.
+        creds.expiry = datetime.utcnow() + timedelta(hours=72)
+        return creds
+
+    @staticmethod
+    def _present_token_path():
+        """A TOKEN_PATH stand-in that reports the token file exists.
+
+        `Path.exists` is read-only on a concrete WindowsPath instance, so we swap
+        the whole module-level TOKEN_PATH for a mock. `from_authorized_user_file`
+        is itself mocked, so the path VALUE handed to it is irrelevant.
+        """
+        tp = mock.MagicMock()
+        tp.exists.return_value = True
+        return tp
+
+    def test_wrong_scope_token_raises_actionable_upload(self) -> None:
+        from tools import youtube_upload
+
+        creds = self._narrow_scope_creds()
+        with mock.patch.object(
+            youtube_upload.Credentials,
+            "from_authorized_user_file",
+            return_value=creds,
+        ), mock.patch.object(
+            youtube_upload, "TOKEN_PATH", self._present_token_path()
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                youtube_upload.load_credentials()
+
+        msg = str(ctx.exception)
+        self.assertIn("scopes", msg)
+        self.assertIn("youtube_oauth_init.py --force", msg)
+        # The check fired via has_scopes (not the validity guard).
+        creds.has_scopes.assert_called_once_with(youtube_upload.SCOPES)
+
+    def test_wrong_scope_token_raises_actionable_analytics(self) -> None:
+        import analytics_pull
+
+        creds = self._narrow_scope_creds()
+        with mock.patch.object(
+            analytics_pull.Credentials,
+            "from_authorized_user_file",
+            return_value=creds,
+        ), mock.patch.object(
+            analytics_pull, "TOKEN_PATH", self._present_token_path()
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                analytics_pull._load_credentials()
+
+        msg = str(ctx.exception)
+        self.assertIn("scopes", msg)
+        self.assertIn("youtube_oauth_init.py --force", msg)
+        creds.has_scopes.assert_called_once_with(analytics_pull.SCOPES)
 
 
 if __name__ == "__main__":

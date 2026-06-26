@@ -19,10 +19,12 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal, TypeVar
 
+import requests
 import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -128,6 +130,70 @@ class QualityCheckFailed(PipelineHalted):
         )
 
 
+class ScriptRuleViolation(PipelineHalted):
+    """Raised when a script breaks a Stage 1.5 hard rule (2026-06-09 review).
+
+    Covers the discovery-floor checks (PU-3 anchor gate / PU-4 modal ban, R2
+    H1/H2) and the word-count bounds halt (PU-11, R2 H4). Semantics per Manager
+    C3: capped regenerate-with-feedback — script generation is a manual-halt
+    LLM stage, so this halt IS the regenerate request. The message names the
+    violated rule(s) so the rewrite is targeted. Attempts are tracked in
+    `<manual_io_dir>/<topic_id>/stage15_regen_attempts.txt`; past
+    ``max_attempts`` the message escalates to the operator instead of asking
+    for another rewrite. The topic is NEVER auto-killed.
+    """
+
+    def __init__(self, topic_id: str, violations: list[str], attempt: int, max_attempts: int):
+        self.topic_id = topic_id
+        self.violations = violations
+        self.attempt = attempt
+        self.max_attempts = max_attempts
+        rules = "\n".join(f"    - {v}" for v in violations)
+        if attempt <= max_attempts:
+            action = (
+                f"  Regenerate attempt {attempt} of {max_attempts}: rewrite "
+                f"script_RESPONSE.txt addressing the feedback above, then re-run the "
+                f"pipeline; it will resume from script generation and re-check.\n"
+            )
+        else:
+            action = (
+                f"  Max regenerate attempts ({max_attempts}) exhausted — surface to the "
+                f"OPERATOR for a manual decision (ship-with-waiver, hand-fix, or "
+                f"reschedule). Do NOT auto-kill the topic.\n"
+            )
+        super().__init__(
+            f"\n\n  [SCRIPT-RULE-GATE] Stage 1.5 hard-rule violation(s) for topic "
+            f"{topic_id}:\n{rules}\n"
+            f"{action}"
+            f"  (Rollback: each check is config-flagged under script_quality in "
+            f"config.yaml — anchor_gate_enabled / modal_ban_enabled / "
+            f"word_count_halt_enabled.)\n"
+        )
+
+
+class MetadataRuleViolation(PipelineHalted):
+    """Raised when generated metadata breaks a config-flagged hard rule (the
+    title-anchor gate, PU-3T). Metadata is a manual-halt LLM stage, so this halt
+    IS the regenerate request: fix the title in metadata_RESPONSE.txt and re-run.
+    The topic is NEVER auto-killed. One-flip rollback via
+    ``script_quality.title_anchor_gate_enabled``.
+    """
+
+    def __init__(self, topic_id: str, violations: list[str]):
+        self.topic_id = topic_id
+        self.violations = violations
+        rules = "\n".join(f"    - {v}" for v in violations)
+        super().__init__(
+            f"\n\n  [METADATA-RULE-GATE] metadata hard-rule violation(s) for topic "
+            f"{topic_id}:\n{rules}\n"
+            f"  Rewrite the YOUTUBE SHORTS Title in metadata_RESPONSE.txt so its "
+            f"first 3 words carry a recognizable anchor, then re-run; the pipeline "
+            f"resumes from metadata generation and re-checks.\n"
+            f"  (Rollback: set script_quality.title_anchor_gate_enabled: false in "
+            f"config.yaml.)\n"
+        )
+
+
 class IntegrityCheckFailed(PipelineHalted):
     """Raised when `tools.media_integrity.check_integrity` rejects a master or variant.
 
@@ -173,7 +239,7 @@ class ScriptDraft(BaseModel):
     hook_variants: list[str]                 # exactly 3 per the script-gen prompt
     hook_formulas: list[str] = []            # optional formula names per hook (Contradiction, etc.)
     chosen_hook_index: int | None = None     # filled in during human review
-    body: str                                # 100–150 words with [B-ROLL: ...] cues inline
+    body: str                                # 80–95 spoken words (aim ~88) with [B-ROLL: ...] cues inline
     broll_cues: list[str]                    # parsed from body
     fact_check_queue: list[str]              # claims the LLM flagged for verification
     word_count: int
@@ -228,6 +294,11 @@ class MetadataBundle(BaseModel):
     # Pattern name from prompts/library/thumbnail_patterns.md, drives the renderer.
     # Defaults to "big_text_claim" when the metadata LLM omits the field (legacy responses).
     cover_pattern_name: str = "big_text_claim"
+    # Operator pastes-and-pins this at upload (PU-2, 2026-05-29). One short non-URL
+    # line in the friend voice posing the script's stakes-tied closing question.
+    # Not consumed by any render/upload stage — surfaced for the manual Saturday
+    # engagement SOP. Empty when the metadata LLM omits the section (legacy responses).
+    pinned_comment: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +325,88 @@ def load_config(config_path: Path | None = None) -> dict:
         config = yaml.safe_load(f)
 
     return config
+
+
+# WORKFLOW_AUDIT_2026-05-31 M4: the keys every CLI entrypoint needs before it can
+# run a stage. Missing keys previously surfaced as a bare KeyError deep inside a
+# stage (e.g. config["assets"]["preferred_stock_provider"] at fetch_assets); this
+# lets the CLI fail fast at startup with ALL the missing paths named at once.
+# NOTE: validate_config only ASSERTS PRESENCE — it never injects defaults or
+# mutates values, so the sacred keys (fact_check.require_human_resolution /
+# auto_resolve_gate_2, publishing.human_qa_required / kill_switch) are read-only here.
+_REQUIRED_CONFIG_KEYS: dict[str, list[str]] = {
+    "paths": ["channel_root", "logs", "prompts", "project_root"],
+    "channel": ["style_guide_path"],
+    "llm": ["primary_provider", "manual_io_dir"],
+    "tts": ["provider"],
+    "assets": ["preferred_stock_provider"],
+    "fact_check": ["require_human_resolution", "auto_resolve_gate_2"],
+    "publishing": ["human_qa_required", "kill_switch"],
+    "logging": ["level"],
+}
+
+
+def validate_config(config: dict) -> None:
+    """Assert every required `section.key` is present in `config`.
+
+    Raises a single aggregated ``ValueError`` listing ALL missing paths, so the
+    operator fixes config.yaml in one pass instead of chasing one KeyError per
+    run. Called from the CLI entrypoints (NOT from bare ``load_config``, which
+    stays permissive so the dual-agent isolation contract test — which loads a
+    deliberately minimal config — is unaffected).
+
+    Presence-only: this reads keys to confirm they exist; it never writes or
+    defaults them, so the sacred fact_check/publishing values are untouched.
+    """
+    missing: list[str] = []
+    for section, keys in _REQUIRED_CONFIG_KEYS.items():
+        block = config.get(section)
+        if not isinstance(block, dict):
+            # The whole section is absent (or not a mapping) — every key under it
+            # is missing; name them all so the message is actionable.
+            missing.extend(f"{section}.{k}" for k in keys)
+            continue
+        for k in keys:
+            if k not in block:
+                missing.append(f"{section}.{k}")
+    if missing:
+        raise ValueError(
+            "config.yaml is missing required key(s): "
+            + ", ".join(missing)
+            + ". Edit config.yaml (see config.yaml.template) and re-run."
+        )
+
+    # Optional dual-track block (added 2026-06-21). NOT in _REQUIRED_CONFIG_KEYS —
+    # absent means single-track mode. If present, validate its types so a malformed
+    # block fails loud at startup rather than mid-run. (Presence-only otherwise.)
+    tracks = config.get("tracks")
+    if tracks is not None:
+        track_errors: list[str] = []
+        if not isinstance(tracks, dict):
+            track_errors.append("tracks must be a mapping")
+        else:
+            dte = tracks.get("dual_track_enabled")
+            if "dual_track_enabled" in tracks and not isinstance(dte, bool):
+                track_errors.append("tracks.dual_track_enabled must be true/false")
+            gt = tracks.get("general_tech")
+            if gt is not None:
+                if not isinstance(gt, dict):
+                    track_errors.append("tracks.general_tech must be a mapping")
+                else:
+                    sb = gt.get("suppress_ai_vendor_bonus")
+                    if "suppress_ai_vendor_bonus" in gt and not isinstance(sb, bool):
+                        track_errors.append(
+                            "tracks.general_tech.suppress_ai_vendor_bonus must be true/false"
+                        )
+                    slot = gt.get("slot")
+                    if "slot" in gt and (not isinstance(slot, int) or isinstance(slot, bool)):
+                        track_errors.append("tracks.general_tech.slot must be an integer")
+        if track_errors:
+            raise ValueError(
+                "config.yaml has a malformed [tracks] block: "
+                + "; ".join(track_errors)
+                + ". See config.yaml.template."
+            )
 
 
 def setup_logging(config: dict, run_id: str) -> Path:
@@ -371,13 +524,40 @@ _HOOK_FORMULA_RE = re.compile(r"\[\s*formula\s*:\s*([^\]]+?)\s*\]", re.IGNORECAS
 # Parses one line of the QUALITY_SCORES section: `- name: value` where value is a float or a string (rationale)
 _QUALITY_LINE_RE = re.compile(r"^\s*[-*]\s*([A-Za-z_]+)\s*:\s*(.+?)\s*$", re.MULTILINE)
 
+# Soft (advisory) set of the hook-formula short names the script-gen prompt
+# examples emit (prompts/library/viral_hooks.md, prompts/03_script_generation.md).
+# These are PROSE-headed in viral_hooks.md with no machine-readable list and the
+# `[formula: X]` names are short forms, so this is WARN-ONLY: an unrecognized
+# name (a typo, or a genuinely new formula) logs a warning but never rejects.
+# Compared casefolded so capitalization/spacing in the annotation doesn't matter.
+_KNOWN_HOOK_FORMULAS = {
+    "contradiction",
+    "specific-number promise",
+    "result-first mid-action",
+    "comparison frame",
+    "anti-pattern setup",
+    "specific-question",
+    "measured-claim",
+    "cited-observation lead",
+    "format-branded",
+    "you're doing it wrong",
+    "result-first",
+    "personal-breakthrough lead",   # #15 — general-tech / crazy-story LEAD formula (2026-06-21)
+}
+
 
 def _extract_broll(body: str) -> tuple[list[str], str]:
     """Extract `[B-ROLL: ...]` cues from body, returning (cues, body_without_cues).
 
-    Bracket-depth-aware so cues can contain nested `[VERIFY: ...]` markers, e.g.
-        [B-ROLL: Cursor settings showing the "max session length" [VERIFY: name] field]
-    A regex that stops at the first `]` would truncate at the inner VERIFY bracket.
+    Bracket-depth-aware so a cue can contain nested `[...]` brackets, e.g.
+        [B-ROLL: Cursor settings showing the "max session length" field]
+    A regex that stops at the first `]` would truncate at any inner bracket.
+
+    Note (2026-06-19 unification): on the `_parse_script_response` path, `[VERIFY: ...]`
+    tags are already stripped upstream by `script_response_parser._clean_body`, so a
+    nested VERIFY won't reach here from there. The depth-awareness still matters for
+    OTHER callers that pass a not-yet-cleaned body (e.g. the operator-signed
+    script_FINAL.txt in `await_fact_check_resolution`) and for any other nested bracket.
     """
     cues: list[str] = []
     out_parts: list[str] = []
@@ -444,7 +624,9 @@ def _strip_hook_formula(line: str) -> tuple[str, str]:
     return cleaned, formula
 
 
-def _parse_script_response(response: str, topic_id: str) -> ScriptDraft:
+def _parse_script_response(
+    response: str, topic_id: str, config: dict | None = None
+) -> ScriptDraft:
     """Parse the LLM's script-gen response (per prompts/03_script_generation.md format) into ScriptDraft.
 
     Expected layout (newer format):
@@ -471,83 +653,95 @@ def _parse_script_response(response: str, topic_id: str) -> ScriptDraft:
 
     Fails loud with a specific instruction on what to fix in the response file.
     """
+    # M-1 unification (2026-06-19): body extraction + cleaning delegates to the
+    # single shared, section-aware parser (tools.script_response_parser) so
+    # generate_script's body (which manual gate-2 proposes) and the auto gate-2
+    # body (extract_final_script) derive from ONE code path — no more dual-parser
+    # drift. This wrapper keeps the manual-halt validation contract: the specific,
+    # actionable ValueError messages the operator sees to fix script_RESPONSE.txt.
+    from tools.script_response_parser import ScriptResponseParseError, parse_response
+
+    # 1. Exactly 3 HOOK_A/B/C lines (the prompt asks for three variants).
     hook_matches = list(_HOOK_RE.finditer(response))
     if len(hook_matches) != 3:
         raise ValueError(
             f"Expected 3 lines of the form 'HOOK_A:' / 'HOOK_B:' / 'HOOK_C:', "
             f"found {len(hook_matches)}. Edit script_RESPONSE.txt and re-run."
         )
-    hooks: list[str] = []
-    formulas: list[str] = []
-    for m in hook_matches:
-        cleaned, formula = _strip_hook_formula(m.group(2).strip())
-        hooks.append(cleaned)
-        formulas.append(formula)
 
-    fc_marker = _FACT_CHECK_MARKER_RE.search(response)
-    if not fc_marker:
+    # 2. FACT_CHECK_QUEUE section required.
+    if not _FACT_CHECK_MARKER_RE.search(response):
         raise ValueError(
             "Missing 'FACT_CHECK_QUEUE' section. The LLM must list every claim to be "
             "fact-checked as a bulleted list under that header. Edit script_RESPONSE.txt "
             "and re-run."
         )
 
-    # Body is everything between the end of the last hook line and the FACT_CHECK_QUEUE marker.
-    body = response[hook_matches[-1].end():fc_marker.start()].strip()
-    body = re.sub(r"\n+-{3,}\s*$", "", body).strip()  # strip trailing horizontal rule
-    # Some LLMs emit `CHOSEN HOOK: HOOK_X` and/or a `SCRIPT:` divider between the
-    # hooks block and the body. They are not in the prompt template, but if present
-    # they leak into TTS as spoken text (caught at gate 3 on 2026-05-07_003 / _004).
-    # Strip these meta-marker lines defensively.
-    body = re.sub(
-        r"^[ \t]*(?:CHOSEN[ \t]+HOOK[ \t]*:[^\n]*|SCRIPT[ \t]*:[ \t]*)\n",
-        "",
-        body,
-        flags=re.IGNORECASE | re.MULTILINE,
-    ).strip()
-    if not body:
+    # 3. Section-aware parse: handles SCRIPT_BODY headers, strips [VERIFY] tags +
+    #    ALL-CAPS template placeholders + CHOSEN HOOK:/SCRIPT: dividers + a
+    #    trailing `---` rule, preserves [B-ROLL: ...] cues inline.
+    try:
+        parsed = parse_response(response)
+    except ScriptResponseParseError as exc:
         raise ValueError(
-            "Body is empty. The LLM must write a 100–150 word script between the hooks "
-            "and the FACT_CHECK_QUEUE section. Edit script_RESPONSE.txt and re-run."
-        )
+            "Body is empty. The LLM must write the script between the hooks and the "
+            "FACT_CHECK_QUEUE section. Edit script_RESPONSE.txt and re-run."
+        ) from exc
 
+    hooks = [parsed.hook_a_text, parsed.hook_b_text, parsed.hook_c_text]
+    if any(h is None for h in hooks):
+        missing = [f"HOOK_{ltr}" for ltr, h in zip(("A", "B", "C"), hooks) if h is None]
+        raise ValueError(
+            f"Missing {', '.join(missing)} line(s) — provide exactly one each of "
+            f"HOOK_A / HOOK_B / HOOK_C. Edit script_RESPONSE.txt and re-run."
+        )
+    formulas = [
+        parsed.hook_a_formula or "",
+        parsed.hook_b_formula or "",
+        parsed.hook_c_formula or "",
+    ]
+    for formula, letter in zip(formulas, ("A", "B", "C")):
+        # WORKFLOW_AUDIT_2026-05-31 L1: advisory only — viral_hooks.md has no
+        # machine-readable formula list and new formulas are expected, so a name
+        # we don't recognize logs a WARNING but never rejects the draft.
+        if formula and formula.casefold() not in _KNOWN_HOOK_FORMULAS:
+            log.warning(
+                "unknown hook formula %r on HOOK_%s — not in viral_hooks.md; "
+                "keeping (tolerant for new formulas)",
+                formula, letter,
+            )
+
+    body = parsed.script_body_text
     broll_cues, body_no_broll = _extract_broll(body)
 
-    # If a QUALITY_SCORES marker exists, the fact-check section ends there.
-    quality_marker = _QUALITY_SCORES_MARKER_RE.search(response, pos=fc_marker.end())
-    if quality_marker:
-        fc_section = response[fc_marker.end():quality_marker.start()]
-        quality_section = response[quality_marker.end():]
-    else:
-        fc_section = response[fc_marker.end():]
-        quality_section = ""
-    fact_check_queue = [m.group(1).strip() for m in _BULLET_RE.finditer(fc_section)]
-    quality_scores, quality_rationale = (
-        _parse_quality_scores(quality_section) if quality_section else ({}, "")
-    )
-
+    # WORKFLOW_AUDIT_2026-05-31 L1: word-count outlier rails from NON-SACRED config
+    # keys read with .get() defaults (so a config without them still parses — the
+    # dual-agent isolation fixtures rely on load_config staying permissive).
+    sq = (config or {}).get("script_quality", {}) if config is not None else {}
+    word_count_min = int(sq.get("word_count_min", 80))
+    word_count_max = int(sq.get("word_count_max", 200))
     word_count = len(body_no_broll.split())
-    if word_count < 80 or word_count > 200:
+    if word_count < word_count_min or word_count > word_count_max:
         log.warning(
-            "script body is %d words; prompt asked for 100–150. Operator should review.",
-            word_count,
+            "script body is %d words; expected %d–%d. Operator should review.",
+            word_count, word_count_min, word_count_max,
         )
 
     return ScriptDraft(
         topic_id=topic_id,
-        hook_variants=hooks,
+        hook_variants=[h for h in hooks if h is not None],
         hook_formulas=formulas,
         body=body,
         broll_cues=broll_cues,
-        fact_check_queue=fact_check_queue,
+        fact_check_queue=parsed.fact_check_queue,
         word_count=word_count,
-        quality_scores=quality_scores,
-        quality_rationale=quality_rationale,
+        quality_scores=parsed.quality_scores,
+        quality_rationale=parsed.quality_rationale or "",
     )
 
 
 def generate_script(topic: TopicJob, config: dict) -> ScriptDraft:
-    """Stage 1: LLM produces 3 hook variants + a 100–150 word script with [B-ROLL] cues.
+    """Stage 1: LLM produces 3 hook variants + an 80–95 word script with [B-ROLL] cues.
 
     Dispatches on `config.llm.primary_provider`:
       - "manual" (default): write filled prompt to <manual_io_dir>/<topic_id>/script_PROMPT.txt,
@@ -582,7 +776,7 @@ def generate_script(topic: TopicJob, config: dict) -> ScriptDraft:
     )
 
     response = _await_manual_response(prompt, "script", topic.id, config)
-    return _parse_script_response(response, topic.id)
+    return _parse_script_response(response, topic.id, config)
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +797,292 @@ SCRIPT_QUALITY_DIMENSIONS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Stage 1.5 hard hook rules — 2026-06-09 weekly review, PU-3 + PU-4 (R2 H1/H2)
+# discovery-floor change-set, plus the PU-11 word-count halt (R2 H4).
+# All config-flagged under `script_quality` for one-flip rollback.
+# ---------------------------------------------------------------------------
+
+_STAGE15_BROLL_RE = re.compile(r"\[B-ROLL:[^\]]*\]", re.IGNORECASE)
+
+# Modal / hypothetical openers banned in sentence 1 + title (PU-4, R2 H2: the
+# 10-view-floor autopsy). The spoken-body gate can't see the title (it doesn't
+# exist yet at Stage 1.5). The matching first-3-words TITLE gate (PU-3T) runs
+# later at the metadata stage — see `title_anchor_violation` +
+# `_enforce_metadata_hard_rules`; the prompt rule lives in 06_metadata_generation.md.
+_MODAL_OPENER_RE = re.compile(
+    r"\b(?:could|might)\b|\bimagine\s+if\b|\bwhat\s+if\b", re.IGNORECASE
+)
+
+# Curated vendor/brand names a layman recognizes on sight (lowercase). Part of
+# the PU-3 anchor heuristic — extend freely, it only ever ADMITS scripts.
+_KNOWN_VENDOR_NAMES = frozenset({
+    "chatgpt", "openai", "claude", "anthropic", "gemini", "google", "deepmind",
+    "apple", "siri", "iphone", "microsoft", "copilot", "windows", "meta",
+    "facebook", "instagram", "whatsapp", "llama", "tesla", "elon", "musk",
+    "grok", "xai", "nvidia", "amazon", "alexa", "android", "samsung", "tiktok",
+    "youtube", "netflix", "spotify", "reddit", "midjourney", "deepseek",
+    "perplexity", "bing", "sora", "gpt", "disney", "uber", "walmart",
+    # Extended 2026-06-24 (title-anchor gate): brands/people the channel covers
+    # whose names were otherwise unrecognized. Admit-only — safe for PU-3 too.
+    "neuralink", "altman", "zuckerberg", "nadella", "pichai", "hassabis",
+    "murati", "cursor", "suno", "runway", "elevenlabs", "mistral", "spacex",
+    "waymo", "figma", "canva", "notion", "slack", "discord", "zoom", "github",
+    "paypal", "snapchat", "pinterest", "linkedin", "karpathy",
+})
+
+# Curated universal consumer concepts (lowercase) — the non-name anchors a
+# general viewer parses in under a second (PU-3, R2 H1).
+_UNIVERSAL_CONSUMER_CONCEPTS = frozenset({
+    "ai", "a.i.", "robot", "robots", "chatbot", "chatbots", "phone", "phones",
+    "smartphone", "internet", "lawsuit", "court", "judge", "police", "fbi",
+    "government", "congress", "billion", "billions", "million", "millions",
+    "money", "scam", "scams", "hacked", "hacker", "hackers", "banned",
+    "doctor", "doctors", "hospital", "teacher", "teachers", "school",
+    "schools", "job", "jobs", "boss", "kids", "teens", "grandma", "mom",
+    "dad", "election", "president", "deepfake", "deepfakes",
+})
+
+
+def _spoken_text(body: str) -> str:
+    """Script body with [B-ROLL: ...] cues stripped — what the TTS will speak."""
+    return re.sub(r"\s+", " ", _STAGE15_BROLL_RE.sub(" ", body)).strip()
+
+
+def _first_spoken_sentence(body: str) -> str:
+    """First sentence of the spoken body (up to the first . ! or ?)."""
+    spoken = _spoken_text(body)
+    m = re.match(r"^(.+?[.!?])(?:\s|$)", spoken)
+    return m.group(1).strip() if m else spoken
+
+
+def _normalize_word(word: str) -> str:
+    """Strip surrounding punctuation + a possessive 's for anchor matching."""
+    w = word.strip(".,!?;:'\"“”‘’()[]…—–-")
+    w = re.sub(r"[’']s$", "", w)
+    return w
+
+
+def anchor_gate_violation(body: str) -> str | None:
+    """PU-3 (R2 H1) first-4-words anchor heuristic. None = OK, str = feedback.
+
+    The first 4 spoken words must contain at least one of:
+      - a concrete number (any digit),
+      - a known vendor/brand name (curated list),
+      - a universal consumer concept (curated list),
+      - a capitalized proper noun — any word past position 1 starting uppercase,
+        or any word with an interior capital (camelCase brands like "iPhone").
+        The very first word being capitalized is NOT evidence; every sentence
+        starts that way.
+    """
+    words = _spoken_text(body).split()[:4]
+    if not words:
+        return "script body has no spoken words"
+    cleaned = [_normalize_word(w) for w in words]
+    for i, w in enumerate(cleaned):
+        if not w:
+            continue
+        if any(ch.isdigit() for ch in w):
+            return None  # concrete number
+        if w.lower() in _KNOWN_VENDOR_NAMES:
+            return None  # known brand/product
+        if w.lower() in _UNIVERSAL_CONSUMER_CONCEPTS:
+            return None  # universal consumer concept
+        if len(w) >= 2 and any(ch.isupper() for ch in w[1:]):
+            return None  # interior capital — camelCase brand / acronym
+        if i >= 1 and w[0].isupper():
+            return None  # capitalized proper noun past sentence start
+    return (
+        f"first 4 spoken words ({' '.join(words)!r}) contain no recognizable "
+        f"named anchor — need a person, brand/product, concrete number, or "
+        f"universal consumer concept in the opening 4 words"
+    )
+
+
+def _title_is_title_case(words: list[str]) -> bool:
+    """Heuristic: is the title written in Title Case (most words capitalized)? If
+    so, mid-title capitalization is NOT evidence of a proper noun. ShadowVerse
+    writes sentence-case titles, so this is normally False. Judged over words of
+    length >= 4 to ignore the short function words (of/the/to/a) that stay
+    lowercase even in Title Case."""
+    sig = [w for w in (_normalize_word(x) for x in words) if len(w) >= 4]
+    if len(sig) < 3:
+        return False
+    capped = sum(1 for w in sig if w[0].isupper())
+    return capped / len(sig) >= 0.8
+
+
+def title_anchor_violation(title: str) -> str | None:
+    """PU-3T first-3-words TITLE anchor gate. None = OK, str = feedback.
+
+    The de-facto thumbnail: ShadowVerse uploads no custom thumbnails, so the
+    title text is the cold-feed stop signal, and every video that has ever
+    cleared the breakout ceiling carried a recognizable anchor in its title. The
+    first 3 title words must contain at least one of:
+      - a concrete number (any digit),
+      - a known vendor/brand/household-name person (curated PU-3 list),
+      - an interior-capital token (camelCase brand / acronym — iPhone, GPT-5, FBI),
+      - a universal consumer concept, INCLUDING bare "AI" (operator decision
+        2026-06-24: "AI" is an accepted anchor for this AI-focused channel),
+      - a capitalized proper noun PAST the first word (Karpathy, Figma, Nobel) in
+        a sentence-case title — names the curated lexicon doesn't list.
+
+    Like the spoken-body gate (``anchor_gate_violation``), "AI" counts as an
+    anchor. The title gate's only twist is that a title's always-capitalized
+    first word is not proof of a proper noun, so capitalization is trusted only
+    for words 2-3 of a sentence-case title (a Title-Cased title capitalizes
+    everything, so it carries no signal — judged by ``_title_is_title_case``).
+    ADMIT-biased: the lexicons + the cap rule only ever pass a title. What still
+    fails: a no-anchor opener with no brand, person, number, vivid concept, or
+    "AI" in the first 3 words (dev-infra like "uv replaced pip"; abstract like
+    "We're more patient than...").
+    """
+    if not title or not title.strip():
+        return "title is empty"
+    all_words = title.split()
+    trust_caps = not _title_is_title_case(all_words)
+    words = all_words[:3]
+    for i, raw in enumerate(words):
+        w = _normalize_word(raw)
+        if not w:
+            continue
+        lw = w.lower()
+        if any(ch.isdigit() for ch in w):
+            return None  # concrete number
+        if lw in _KNOWN_VENDOR_NAMES:
+            return None  # known brand / product / household-name person
+        if len(w) >= 2 and any(ch.isupper() for ch in w[1:]):
+            return None  # interior capital — camelCase brand / acronym
+        if lw in _UNIVERSAL_CONSUMER_CONCEPTS:
+            return None  # vivid consumer object (lawsuit, robot, billion...)
+        if trust_caps and i >= 1 and w[0].isupper():
+            return None  # proper noun past the always-capitalized first word
+    return (
+        f"title's first 3 words ({' '.join(words)!r}) carry no recognizable "
+        f"anchor — lead with a known brand/person, a concrete number, or a vivid "
+        f"consumer object in the first 3 words (a bare 'This AI'/'Your AI'/'A new "
+        f"AI' opener fails; the title is the de-facto thumbnail)"
+    )
+
+
+def modal_opener_violation(sentence: str) -> str | None:
+    """PU-4 (R2 H2) modal-framing ban. None = OK, str = feedback.
+
+    Sentence 1 must state a dated factual event; modal/hypothetical framings
+    ("could", "might", "imagine if", "what if") are banned in it.
+    """
+    m = _MODAL_OPENER_RE.search(sentence)
+    if m is None:
+        return None
+    return (
+        f"modal/hypothetical framing {m.group(0)!r} in the first sentence "
+        f"({sentence!r}) — sentence 1 must state a dated factual event, not a "
+        f"could/might/imagine-if/what-if hypothetical"
+    )
+
+
+def _stage15_attempts_path(config: dict, topic_id: str) -> Path | None:
+    manual_io_dir = (config.get("llm") or {}).get("manual_io_dir")
+    if not manual_io_dir:
+        return None
+    return Path(manual_io_dir) / topic_id / "stage15_regen_attempts.txt"
+
+
+def _bump_stage15_attempts(config: dict, topic_id: str) -> int:
+    """Increment + persist the per-topic regenerate counter. Fail-soft: the
+    HALT is the load-bearing part; the counter is bookkeeping, so I/O issues
+    log a warning and report attempt 1 rather than masking the gate."""
+    path = _stage15_attempts_path(config, topic_id)
+    if path is None:
+        log.warning(
+            "stage 1.5 regen counter: llm.manual_io_dir unset — cannot persist "
+            "attempt count for %s; reporting attempt 1",
+            topic_id,
+        )
+        return 1
+    try:
+        previous = int(path.read_text(encoding="utf-8").strip()) if path.exists() else 0
+    except (OSError, ValueError) as exc:
+        log.warning("stage 1.5 regen counter unreadable at %s (%s); resetting", path, exc)
+        previous = 0
+    attempt = previous + 1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{attempt}\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("stage 1.5 regen counter not persisted at %s (%s)", path, exc)
+    return attempt
+
+
+def _clear_stage15_attempts(config: dict, topic_id: str) -> None:
+    """Remove the regen counter once the hard rules pass, so a future topic
+    re-run starts its attempt budget fresh."""
+    path = _stage15_attempts_path(config, topic_id)
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("stage 1.5 regen counter not cleared at %s (%s)", path, exc)
+
+
+# Manager C3 (2026-06-09): capped regenerate-with-feedback — after this many
+# tracked attempts the halt message escalates to the operator. Never auto-kill.
+STAGE15_MAX_REGEN_ATTEMPTS = 2
+
+
+def _enforce_script_hard_rules(script: ScriptDraft, config: dict) -> None:
+    """Run the config-flagged Stage 1.5 hard rules; raise ScriptRuleViolation
+    (a halt) with rule-specific feedback when any are broken.
+
+    Flags (all default OFF so legacy configs keep legacy behavior; production
+    config.yaml + template set them true — one-flip rollback each):
+      - script_quality.anchor_gate_enabled   (PU-3, R2 H1)
+      - script_quality.modal_ban_enabled     (PU-4, R2 H2)
+      - script_quality.word_count_halt_enabled (PU-11, R2 H4 — bounds come from
+        the existing word_count_min/word_count_max keys; set word_count_max
+        back to 200 to loosen)
+    """
+    qcfg = config.get("script_quality") or {}
+    violations: list[str] = []
+
+    if bool(qcfg.get("anchor_gate_enabled", False)):
+        v = anchor_gate_violation(script.body)
+        if v:
+            violations.append(f"anchor gate (PU-3, R2 H1): {v}")
+
+    if bool(qcfg.get("modal_ban_enabled", False)):
+        v = modal_opener_violation(_first_spoken_sentence(script.body))
+        if v:
+            violations.append(f"modal ban (PU-4, R2 H2): {v}")
+
+    if bool(qcfg.get("word_count_halt_enabled", False)):
+        wc_min = int(qcfg.get("word_count_min", 80))
+        wc_max = int(qcfg.get("word_count_max", 200))
+        if not (wc_min <= script.word_count <= wc_max):
+            violations.append(
+                f"word count (PU-11, R2 H4): body is {script.word_count} spoken "
+                f"words, outside [{wc_min}, {wc_max}] — cut the script to fit "
+                f"(or raise script_quality.word_count_max back to 200 to loosen)"
+            )
+
+    if violations:
+        attempt = _bump_stage15_attempts(config, script.topic_id)
+        log.error(
+            "Stage 1.5 hard-rule violation(s) on %s (attempt %d/%d): %s",
+            script.topic_id, attempt, STAGE15_MAX_REGEN_ATTEMPTS,
+            "; ".join(violations),
+        )
+        raise ScriptRuleViolation(
+            topic_id=script.topic_id,
+            violations=violations,
+            attempt=attempt,
+            max_attempts=STAGE15_MAX_REGEN_ATTEMPTS,
+        )
+
+    _clear_stage15_attempts(config, script.topic_id)
+
+
 def evaluate_script_quality(script: ScriptDraft, config: dict) -> ScriptDraft:
     """Stage 1.5: read the self-scored quality fields and gate on them.
 
@@ -611,10 +1091,14 @@ def evaluate_script_quality(script: ScriptDraft, config: dict) -> ScriptDraft:
       - enforce_min_score (bool, default false): when true, halt below threshold;
         when false, log a warning but pass through
 
-    Pass-through cases (no halt regardless of enforce flag):
-      - Response was parsed but contained no QUALITY_SCORES section (legacy / older
-        prompt). Logs a warning so the operator knows the gate is a no-op.
-      - All dimensions present but the operator hasn't enabled enforcement yet.
+    Scoring denominator (H-3, 2026-06-19):
+      - require_full_dimensions=true (production): the mean is over ALL canonical
+        dimensions with a missing one counting as 0.0, so an LLM can't inflate
+        its score by omitting weak dimensions and a response with no
+        QUALITY_SCORES section scores 0.0 -> halts under enforce.
+      - require_full_dimensions=false (legacy/code default): tolerant — a missing
+        section or no recognized dimensions passes through with a warning; the
+        mean is over only the present dimensions.
 
     Returns the same ScriptDraft unchanged on success — this is a pure gate, not a
     transform. The scores are already in script.quality_scores from the parser.
@@ -651,28 +1135,56 @@ def evaluate_script_quality(script: ScriptDraft, config: dict) -> ScriptDraft:
                 "is conditional on Stage 1.5 passing."
             )
 
-    if not script.quality_scores:
-        log.warning(
-            "script quality gate: no QUALITY_SCORES section in response for %s — "
-            "gate is a no-op. Re-issue script_RESPONSE.txt with the section to enable scoring.",
-            script.topic_id,
-        )
-        return script
+    # Hard rules first (2026-06-09 review: PU-3 anchor gate, PU-4 modal ban,
+    # PU-11 word-count halt). Independent of the self-scored dimensions — they
+    # run even when QUALITY_SCORES is absent. May raise ScriptRuleViolation.
+    _enforce_script_hard_rules(script, config)
 
-    # Equal-weighted mean across the canonical dimensions; ignore extras the LLM may add.
+    # H-3 (2026-06-19 review): never take the mean over only the dimensions the
+    # LLM chose to emit — that lets it inflate its score by dropping its weak
+    # dimensions (scorer-controlled denominator), and a response with NO
+    # QUALITY_SCORES section silently passed. When require_full_dimensions is
+    # set, score over the FULL canonical set with a missing dimension counting
+    # as 0.0, so omission can only HURT the mean and an absent section scores
+    # 0.0 -> halts under enforce. Config-flagged for one-flip rollback; the code
+    # default False preserves the legacy tolerant gate (keeps old configs/tests).
+    require_full = bool(qcfg.get("require_full_dimensions", False))
     present = [d for d in SCRIPT_QUALITY_DIMENSIONS if d in script.quality_scores]
-    if not present:
-        log.warning(
-            "script quality gate: QUALITY_SCORES section had no recognized dimensions for %s. "
-            "Expected any of: %s",
-            script.topic_id, ", ".join(SCRIPT_QUALITY_DIMENSIONS),
-        )
-        return script
 
-    total = sum(script.quality_scores[d] for d in present) / len(present)
+    if require_full:
+        missing = [d for d in SCRIPT_QUALITY_DIMENSIONS if d not in script.quality_scores]
+        if missing:
+            log.warning(
+                "script quality gate: %s missing dimension(s) %s — each scored 0.0 "
+                "(require_full_dimensions). Re-issue script_RESPONSE.txt with all of: %s",
+                script.topic_id, ", ".join(missing), ", ".join(SCRIPT_QUALITY_DIMENSIONS),
+            )
+        total = sum(
+            script.quality_scores.get(d, 0.0) for d in SCRIPT_QUALITY_DIMENSIONS
+        ) / len(SCRIPT_QUALITY_DIMENSIONS)
+    else:
+        # Legacy tolerant gate: a missing section / no recognized dims pass through.
+        if not script.quality_scores:
+            log.warning(
+                "script quality gate: no QUALITY_SCORES section in response for %s — "
+                "gate is a no-op. Re-issue script_RESPONSE.txt with the section to enable scoring.",
+                script.topic_id,
+            )
+            return script
+        if not present:
+            log.warning(
+                "script quality gate: QUALITY_SCORES section had no recognized dimensions for %s. "
+                "Expected any of: %s",
+                script.topic_id, ", ".join(SCRIPT_QUALITY_DIMENSIONS),
+            )
+            return script
+        total = sum(script.quality_scores[d] for d in present) / len(present)
+
     log.info(
-        "script quality: %s weighted_total=%.3f over %d/%d dimensions (min=%.2f, enforce=%s)",
-        script.topic_id, total, len(present), len(SCRIPT_QUALITY_DIMENSIONS), min_score, enforce,
+        "script quality: %s weighted_total=%.3f over %d/%d scored dimensions "
+        "(min=%.2f, enforce=%s, require_full=%s)",
+        script.topic_id, total, len(present), len(SCRIPT_QUALITY_DIMENSIONS),
+        min_score, enforce, require_full,
     )
     if script.quality_rationale:
         log.info("script quality rationale: %s", script.quality_rationale)
@@ -697,6 +1209,23 @@ def evaluate_script_quality(script: ScriptDraft, config: dict) -> ScriptDraft:
             "Stage 1.5 OK on %s (weighted_total=%.3f >= %.2f)",
             script.topic_id, total, min_score,
         )
+
+    # Fail-soft learning telemetry (self-improving loop): persist the parsed
+    # per-dimension quality scores so the loop can correlate craft with reach.
+    # A telemetry error must NEVER break Stage 1.5 — log and swallow.
+    try:
+        from learning.telemetry import append_script_quality
+
+        channel_root = (config.get("paths") or {}).get("channel_root")
+        if channel_root:
+            append_script_quality(
+                channel_root,
+                topic_id=script.topic_id,
+                dims=dict(script.quality_scores),
+                weighted_total=total,
+            )
+    except Exception as exc:  # noqa: BLE001 — telemetry never breaks the gate
+        log.warning("learning telemetry append failed for %s: %s", script.topic_id, exc)
 
     return script
 
@@ -806,10 +1335,31 @@ def _parse_factcheck_response(response: str, topic_id: str) -> FactCheckReport:
         "tool": -1,
     }
     if header_idx is not None:
-        for j, cell in enumerate(_cells(raw_rows[header_idx])):
+        header_cells = _cells(raw_rows[header_idx])
+        mapped_from_header: set[str] = set()
+        for j, cell in enumerate(header_cells):
             key = _classify_header_cell(cell)
             if key is not None:
                 col_map[key] = j
+                mapped_from_header.add(key)
+
+        # WORKFLOW_AUDIT_2026-05-31 L2: a header row WAS detected, but only keys
+        # that classified got their column overwritten — any required column
+        # (claim/status/url) that failed to classify SILENTLY retains its
+        # positional default, which under a reordered table points at the WRONG
+        # cell. Fail loud instead of parsing the wrong column. ADDITIVE: this runs
+        # only when a header is present (header_idx is not None) and BEFORE the
+        # row loop, so the no-header positional path and the downstream H2/status/
+        # tool raises are untouched. Tool is optional → excluded from the set.
+        required_cols = ("claim", "status", "url")
+        unmapped = [c for c in required_cols if c not in mapped_from_header]
+        if unmapped:
+            raise ValueError(
+                "Fact-check table header detected but could not map required "
+                f"column(s): {{{', '.join(unmapped)}}}. Saw header cells: "
+                f"{header_cells}. Rename them to Claim / Status / Source URL "
+                "(aliases allowed) and re-run factcheck_RESPONSE.txt."
+            )
 
     tool_column_present = col_map["tool"] >= 0
     if not tool_column_present:
@@ -846,6 +1396,21 @@ def _parse_factcheck_response(response: str, topic_id: str) -> FactCheckReport:
         source_quote = _get("quote")
         suggested_fix = _get("fix")
         tool_raw = _get("tool") if tool_column_present else ""
+
+        # WORKFLOW_AUDIT_2026-05-31 H2: reject a row whose Claim cell is empty.
+        # The full-empty-row (836) and literal-"claim"-header (841) skips above
+        # already short-circuit legitimately-blank rows, so reaching here with an
+        # empty claim means a phantom row (e.g. `|  | VERIFIED | url | "q" | | tavily |`)
+        # that would otherwise append a FactClaim with claim_text="" — inflating
+        # unresolved_count and polluting the gate-2 report. Mirror the status/Tool
+        # strict-or-raise pattern. Normalize the same way the FactClaim does so a
+        # whitespace- or quote-only cell is also caught.
+        if not claim_text.strip().strip('"').strip():
+            raise ValueError(
+                f"Empty Claim cell for a fact-check row (status={status_raw!r}). "
+                f"Every row MUST name the claim verbatim. Edit "
+                f"factcheck_RESPONSE.txt and re-run."
+            )
 
         status_key = re.sub(r"[\s_]+", " ", status_raw.upper()).strip()
         status = _STATUS_NORMALIZE.get(status_key)
@@ -945,7 +1510,11 @@ def fact_check_script(script: ScriptDraft, config: dict) -> FactCheckReport:
             f"Set it to 'manual' or 'claude_with_websearch' in config.yaml."
         )
 
-    template = load_prompt("05_fact_check", config)
+    # Prompt is config-selectable so the general-tech track can point at the
+    # stricter crazy-story variant (05_fact_check_general_tech) via its isolated
+    # config; ai-vendor defaults to the standard 6-column prompt (unchanged).
+    prompt_name = config["fact_check"].get("prompt", "05_fact_check")
+    template = load_prompt(prompt_name, config)
 
     # Compose the script content the fact-checker sees: all 3 hook variants + the body
     # (the operator hasn't picked a hook yet, so all candidates are fair game for verification).
@@ -1207,40 +1776,77 @@ def _write_auto_resolution_audit(
 
 
 def _scan_script_for_artifacts_or_halt(
-    script_path: Path, topic_id: str | None = None
+    script_path: Path,
+    topic_id: str | None = None,
+    *,
+    style_guide_path: str | Path | None = None,
 ) -> None:
-    """Sprint 5 Layer-2 safety net: halt the pipeline if ``script_FINAL.txt`` carries template artifacts.
+    """Pre-TTS, once-per-topic script-hygiene gate: halt if ``script_FINAL.txt``
+    carries template artifacts (#14), sourcing-hygiene issues (#15), or a
+    pre-render lint failure (#16).
+
+    Three checks, all run against the SCRIPT body before it reaches TTS (NOT
+    per-variant — that is Stage 11 / `check_variant`):
+
+      * **#14** (Sprint 5 Layer-2): template / internal-name / stage-instruction
+        artifacts (`_12_002` prevention).
+      * **#15** (PU-7b, weekly-review 2026-05-29): residual ``[VERIFY: …]``
+        placeholder tags or anonymous "a Reddit/X user" citations
+        (`_08_001` prevention — R2 §4 + §7).
+      * **#16** (pre-render lint): unresolved placeholder tokens
+        (``[VERIFY`` / ``[NEEDS`` / ``[TODO`` / ``[FIXME``) or a retired/forbidden
+        CTA. The banned-CTA list is pulled from the style guide's
+        retired/forbidden sections (`style_guide_path`) so it stays in sync.
+        Forward-looking guard for `_08_001` ([VERIFY] spoken aloud) and `_11_002`
+        (the retired ``Comment "deploy" and I will send you the link.`` bait).
+
+    All checks aggregate into a single `PipelineQAFailed` so the operator sees
+    every hygiene failure for the script in one halt instead of fixing one,
+    re-running, then tripping the next.
 
     Imports `tools.prepublish_qa` lazily because that module is itself
     `__init__`-importable but has a heavier transitive-import footprint
     (ffprobe helpers, etc.) and pipeline.py is loaded by every CLI entry.
 
+    Args:
+        script_path: the FINAL script to scan.
+        topic_id: surfaced in the halt header.
+        style_guide_path: style guide whose retired/forbidden CTA phrases
+            augment the #16 baseline. When None, #16 falls back to its module
+            default path (and to the built-in baseline if that is unreadable).
+
     Raises:
-        PipelineQAFailed: any artifact match, missing file, or unreadable
+        PipelineQAFailed: any #14 / #15 / #16 match, missing file, or unreadable
             script. Inherits from `PipelineHalted` so the existing halt /
             resume plumbing treats this like any other sacred-gate stop.
     """
     from tools.prepublish_qa import (  # local import to avoid CLI startup cost
         PipelineQAFailed,
-        SCRIPT_ARTIFACT_CHECK_ID,
         check_script,
+        check_script_prerender,
+        check_script_sourcing,
     )
 
-    result = check_script(script_path)
-    if result.ok:
-        return
-    raise PipelineQAFailed(
-        failures={
-            SCRIPT_ARTIFACT_CHECK_ID: {
+    failures: dict[int, dict[str, str]] = {}
+    for result in (
+        check_script(script_path),
+        check_script_sourcing(script_path),
+        check_script_prerender(script_path, style_guide_path=style_guide_path),
+    ):
+        if not result.ok:
+            failures[result.check_id] = {
                 "name": result.name,
                 "expected": result.expected,
                 "actual": result.actual,
                 "message": result.message,
             }
-        },
-        video_path=None,
-        topic_id=topic_id,
-    )
+
+    if failures:
+        raise PipelineQAFailed(
+            failures=failures,
+            video_path=None,
+            topic_id=topic_id,
+        )
 
 
 def await_fact_check_resolution(
@@ -1285,7 +1891,11 @@ def await_fact_check_resolution(
         # to TTS. Prevents the `_12_002` failure mode where edge-TTS spoke
         # "SCRIPT_BODY (uses HOOK_A as the verbal opener):" out loud because
         # the artifact had survived gate-2 resolution into the signed-off file.
-        _scan_script_for_artifacts_or_halt(final_path, script.topic_id)
+        _scan_script_for_artifacts_or_halt(
+            final_path,
+            script.topic_id,
+            style_guide_path=config.get("channel", {}).get("style_guide_path"),
+        )
         new_body = final_path.read_text(encoding="utf-8").strip()
         broll_cues, _ = _extract_broll(new_body)
         word_count = len(_extract_broll(new_body)[1].split())
@@ -1352,7 +1962,11 @@ def await_fact_check_resolution(
         # template artifacts before returning. If the gate-2 LLM hallucinated
         # a SCRIPT_BODY-style header, this halts before TTS instead of letting
         # edge-TTS speak the artifact aloud (the _12_002 failure mode).
-        _scan_script_for_artifacts_or_halt(final_path, script.topic_id)
+        _scan_script_for_artifacts_or_halt(
+            final_path,
+            script.topic_id,
+            style_guide_path=config.get("channel", {}).get("style_guide_path"),
+        )
         broll_cues, body_no_broll = _extract_broll(proposed_body)
         return script.model_copy(update={
             "body": proposed_body,
@@ -1392,10 +2006,57 @@ def _cue_to_query(cue: str) -> str:
     return " ".join(words[:4]) if words else "developer computer"
 
 
+_T = TypeVar("_T")
+
+
+def _retry_with_backoff(
+    fn: Callable[[], _T],
+    *,
+    attempts: int = 3,
+    base_delay: float = 0.5,
+    retry_on: tuple[type[BaseException], ...] = (requests.RequestException,),
+) -> _T:
+    """Call ``fn()``; retry on ``retry_on`` with exponential backoff, re-raise last.
+
+    R1 (WORKFLOW_AUDIT_2026-05-31) — the unified, dependency-free retry primitive
+    for the pipeline's external-API touchpoints. Plain Python (for / try / except +
+    ``time.sleep(base_delay * 2**i)``), NO tenacity/backoff (that is the rejected
+    NEW-DEP path; see feedback_engineering_principles.md — plain Python, explicit
+    calls).
+
+    Sleeps base_delay, 2*base_delay, 4*base_delay … between attempts; the LAST
+    attempt does NOT sleep. On exhaustion the most-recent exception is re-raised so
+    the caller's own handler still runs (e.g. the search functions' ``except
+    requests.RequestException: return None`` preserves the provider-fallback
+    contract). Anything NOT in ``retry_on`` propagates immediately (fail loud).
+
+    Caution: under the dual-agent /start -auto shape retries multiply wall-clock —
+    keep ``attempts`` low and ``base_delay`` small so a stuck provider can't blow
+    the publish-slot timing.
+    """
+    if attempts < 1:
+        raise ValueError(f"attempts must be >= 1, got {attempts}")
+    last_exc: BaseException | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except retry_on as exc:
+            last_exc = exc
+            if i == attempts - 1:
+                break
+            delay = base_delay * (2 ** i)
+            log.warning(
+                "transient failure (attempt %d/%d), retrying in %.2fs: %s",
+                i + 1, attempts, delay, exc,
+            )
+            time.sleep(delay)
+    assert last_exc is not None  # only reachable after at least one caught exc
+    raise last_exc
+
+
 def _search_pexels_video(query: str, api_key: str) -> dict | None:
     """Search Pexels videos (portrait, HD+). Returns dict with url/source/license/page or None."""
-    import requests
-    try:
+    def _do_request() -> requests.Response:
         r = requests.get(
             "https://api.pexels.com/videos/search",
             params={"query": query, "per_page": 5, "orientation": "portrait"},
@@ -1403,8 +2064,22 @@ def _search_pexels_video(query: str, api_key: str) -> dict | None:
             timeout=20,
         )
         r.raise_for_status()
-    except Exception as e:
-        log.warning("pexels search failed for %r: %s", query, e)
+        return r
+
+    try:
+        # R1: a transient blip (timeout / 5xx / dropped socket) now retries with
+        # backoff before giving up, instead of failing on first error. M1's
+        # None-on-final-failure contract is preserved — _retry_with_backoff
+        # re-raises the last exception into this except, which returns None so
+        # fetch_assets still falls back to the other provider.
+        r = _retry_with_backoff(_do_request)
+    except requests.RequestException as e:
+        # M1: narrow from bare Exception to requests.RequestException so a genuinely
+        # unexpected (non-network) error fails loud instead of being swallowed. Keep
+        # returning None — fetch_assets relies on None to fall back to the other
+        # provider; re-raising a 4xx here would break the Pexels→Pixabay chain.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        log.warning("pexels search failed for %r (HTTP %s): %s", query, status, e)
         return None
 
     data = r.json()
@@ -1436,16 +2111,24 @@ def _search_pexels_video(query: str, api_key: str) -> dict | None:
 
 def _search_pixabay_video(query: str, api_key: str) -> dict | None:
     """Search Pixabay videos (vertical). Returns dict or None."""
-    import requests
-    try:
+    def _do_request() -> requests.Response:
         r = requests.get(
             "https://pixabay.com/api/videos/",
             params={"key": api_key, "q": query, "per_page": 5, "video_type": "all"},
             timeout=20,
         )
         r.raise_for_status()
-    except Exception as e:
-        log.warning("pixabay search failed for %r: %s", query, e)
+        return r
+
+    try:
+        # R1: retry transient blips with backoff before giving up (see
+        # _search_pexels_video). None-on-final-failure preserved for the fallback.
+        r = _retry_with_backoff(_do_request)
+    except requests.RequestException as e:
+        # M1: narrowed to requests.RequestException (see _search_pexels_video). Keep
+        # returning None so fetch_assets' provider fallback still triggers.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        log.warning("pixabay search failed for %r (HTTP %s): %s", query, status, e)
         return None
 
     data = r.json()
@@ -1475,25 +2158,40 @@ def _search_pixabay_video(query: str, api_key: str) -> dict | None:
 
 
 def _download_clip(url: str, dest: Path, timeout: int = 90) -> bool:
-    """Download a video clip to `dest`. Skip if already present. Returns True on success."""
+    """Download a video clip to `dest`. Skip if already present. Returns True on success.
+
+    M7: streams to a sibling ``<dest>.part`` temp and only ``os.replace()``s it onto
+    ``dest`` after a fully-successful download. A crash / kill / power-loss therefore
+    leaves a ``.part`` (which the cache check below ignores), never a truncated-but-
+    non-zero ``dest`` that the ``st_size > 0`` fast-path would wrongly treat as a
+    complete cache hit. ``os.replace`` is atomic on the same filesystem.
+    """
     import requests
     if dest.exists() and dest.stat().st_size > 0:
         log.info("clip already cached: %s (%.1f MB)", dest.name, dest.stat().st_size / 1e6)
         return True
+    tmp = dest.with_suffix(dest.suffix + ".part")
     try:
         with requests.get(url, stream=True, timeout=timeout) as r:
             r.raise_for_status()
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with dest.open("wb") as f:
+            with tmp.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 16):
                     if chunk:
                         f.write(chunk)
+        # Only now — full body read with no exception — promote the temp to final.
+        os.replace(tmp, dest)
         log.info("downloaded %s (%.1f MB)", dest.name, dest.stat().st_size / 1e6)
         return True
-    except Exception as e:
-        log.warning("download failed for %s → %s: %s", url, dest.name, e)
-        if dest.exists():
-            dest.unlink(missing_ok=True)
+    except requests.RequestException as e:
+        # M1: narrowed to requests.RequestException. Keep returning False (the
+        # clip loop treats a missed cue as skippable); a non-network error now
+        # propagates loud instead of being silently swallowed as a failed download.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        log.warning("download failed for %s → %s (HTTP %s): %s", url, dest.name, status, e)
+        # M7: clean up the partial temp so it cannot accumulate; never leave a
+        # truncated `dest` behind (os.replace only runs on full success above).
+        tmp.unlink(missing_ok=True)
         return False
 
 
@@ -1518,6 +2216,10 @@ def fetch_assets(script: ScriptDraft, config: dict) -> AssetBundle:
 
     clips: list[Path] = []
     licenses: list[dict] = []
+    # Track which cues produced no clip (no stock match OR download failure) so
+    # the end-of-loop summary names them — otherwise a partial b-roll miss only
+    # shows up as scattered per-cue WARNINGs an operator must grep out of the log.
+    failed: list[tuple[int, str]] = []
 
     for idx, cue in enumerate(script.broll_cues):
         query = _cue_to_query(cue)
@@ -1535,6 +2237,7 @@ def fetch_assets(script: ScriptDraft, config: dict) -> AssetBundle:
         if not match:
             log.warning("[cue %d] no stock match for query %r — skipping (Flux fallback deferred)",
                         idx + 1, query)
+            failed.append((idx, query))
             continue
 
         # Filename: <topic_id>_<idx>_<source>.mp4
@@ -1551,6 +2254,8 @@ def fetch_assets(script: ScriptDraft, config: dict) -> AssetBundle:
                 "page_url": match.get("page_url"),
                 "file": str(dest),
             })
+        else:
+            failed.append((idx, query))
 
     if not clips:
         raise RuntimeError(
@@ -1561,6 +2266,12 @@ def fetch_assets(script: ScriptDraft, config: dict) -> AssetBundle:
     log.info("fetched %d/%d cues (%.1f MB total)",
              len(clips), len(script.broll_cues),
              sum(p.stat().st_size for p in clips) / 1e6)
+    if failed:
+        log.warning(
+            "fetch_assets: %d/%d cues failed: %s",
+            len(failed), len(script.broll_cues),
+            ", ".join(f"#{i}:{q!r}" for i, q in failed),
+        )
 
     # Write a manifest for the renderer to consume
     manifest_path = out_dir / "manifest.json"
@@ -1579,6 +2290,12 @@ def _strip_visual_directions(text: str) -> str:
     return cleaned
 
 
+# edge-tts requires a signed-percent speaking rate ("+10%", "-5%", "+0%"). A
+# malformed value would otherwise sail past here and blow up deep in the synth
+# coroutine with a cryptic error; validate it at the load site instead.
+_TTS_RATE_RE = re.compile(r"^[+-]\d+%$")
+
+
 def _vo_edge_tts(topic_id: str, text: str, audio_dir: Path, config: dict) -> Path:
     """Synthesize VO via Microsoft Edge's public neural TTS endpoint.
 
@@ -1592,6 +2309,11 @@ def _vo_edge_tts(topic_id: str, text: str, audio_dir: Path, config: dict) -> Pat
 
     voice = config["tts"].get("edge_tts_voice", "en-US-AndrewMultilingualNeural")
     rate = str(config["tts"].get("rate", "+0%"))  # edge-tts format: "+10%", "-5%", "+0%"
+    if not _TTS_RATE_RE.fullmatch(rate):
+        raise ValueError(
+            f"config.tts.rate={rate!r} is malformed; edge-tts requires a signed percent "
+            f"like '+10%', '-5%', or '+0%'. Edit config.yaml tts.rate and re-run."
+        )
     mp3_path = audio_dir / f"{topic_id}_vo.mp3"
     wav_path = audio_dir / f"{topic_id}_vo.wav"
 
@@ -1600,7 +2322,37 @@ def _vo_edge_tts(topic_id: str, text: str, audio_dir: Path, config: dict) -> Pat
         await communicate.save(str(mp3_path))
 
     log.info("edge-tts: synthesizing %d chars with voice=%s rate=%s", len(text), voice, rate)
-    asyncio.run(synth())
+
+    # M6 (WORKFLOW_AUDIT_2026-05-31): edge-tts hits Microsoft's PUBLIC endpoint
+    # (no SLA), so a single attempt fails the whole VO stage on a transient 429 /
+    # socket drop. Wrap in a bounded plain-Python retry with exponential backoff;
+    # re-raise the last exception on final failure so a truly-down endpoint still
+    # fails LOUD. RETRY-ONLY — no provider fallback (that's a separate money
+    # decision). tts.* is not a sacred key, so retry count is config-tunable.
+    import time
+
+    import aiohttp  # transitive dep of edge-tts; no new pip line
+
+    retries = int(config["tts"].get("edge_tts_retries", 3))
+    retries = max(1, retries)  # always at least one attempt
+    transient = (aiohttp.ClientError, asyncio.TimeoutError)
+    for attempt in range(1, retries + 1):
+        try:
+            asyncio.run(synth())
+            break
+        except transient as e:
+            if attempt >= retries:
+                log.error(
+                    "edge-tts failed after %d attempt(s): %s — endpoint may be down",
+                    attempt, e,
+                )
+                raise
+            delay = 0.5 * (2 ** (attempt - 1))  # 0.5s, 1s, 2s, ...
+            log.warning(
+                "edge-tts attempt %d/%d failed (%s); retrying in %.1fs",
+                attempt, retries, e, delay,
+            )
+            time.sleep(delay)
     log.info("edge-tts wrote %s (%.1f KB)", mp3_path.name, mp3_path.stat().st_size / 1024)
 
     # Convert MP3 -> WAV mono at target sample rate. Loudness is handled by
@@ -1715,7 +2467,29 @@ def _normalize_vo_loudness(vo_path: Path, config: dict) -> Path:
         target_lra=target_lra,
     )
     import os
-    os.replace(tmp_path, vo_path)
+    import time
+    # Windows flake: a freshly-written WAV is briefly held by AV real-time scan /
+    # the search indexer, so a bare os.replace() can raise PermissionError
+    # [WinError 5] (Access denied) even though nothing of ours holds a handle.
+    # Left unretried this silently leaves the RAW vo.wav in place, the render
+    # muxes un-normalized audio, and Stage 11's LUFS gate fails downstream.
+    # Bounded retry-with-backoff makes the atomic swap resilient; behavior is
+    # otherwise unchanged.
+    last_exc: OSError | None = None
+    for attempt in range(1, 9):
+        try:
+            os.replace(tmp_path, vo_path)
+            last_exc = None
+            break
+        except PermissionError as exc:
+            last_exc = exc
+            log.warning(
+                "Stage 7.5 replace attempt %d/8 hit a lock on %s (%s); backing off",
+                attempt, vo_path.name, exc,
+            )
+            time.sleep(0.5 * attempt)
+    if last_exc is not None:
+        raise last_exc
     log.info(
         "Stage 7.5 done: input_i=%.2f LUFS input_tp=%.2f dBTP target_offset=%.2f",
         measurements.get("input_i", 0.0),
@@ -1723,6 +2497,103 @@ def _normalize_vo_loudness(vo_path: Path, config: dict) -> Path:
         measurements.get("target_offset", 0.0),
     )
     return vo_path
+
+
+def _probe_wav_duration_seconds(wav_path: Path) -> float:
+    """Return the duration of a WAV file in seconds.
+
+    edge-tts and Stage 7.5 (`audio_loudnorm.normalize_vo`) both emit PCM
+    (`pcm_s16le`) WAV, which stdlib `wave` reads with no external process. If
+    the file is not PCM-decodable by `wave` (compressed payload in a .wav
+    container, header quirk), fall back to `ffprobe` via the same subprocess
+    pattern the rest of the pipeline uses for ffmpeg/ffprobe.
+
+    Raises:
+        RuntimeError: neither `wave` nor `ffprobe` could read a duration.
+    """
+    import wave
+
+    wav_path = Path(wav_path)
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+        if rate > 0:
+            return frames / float(rate)
+        log.warning(
+            "wave reported framerate 0 for %s; falling back to ffprobe", wav_path.name
+        )
+    except (wave.Error, OSError, EOFError) as exc:
+        log.debug(
+            "wave could not read %s (%s); falling back to ffprobe", wav_path.name, exc
+        )
+
+    # Fallback: ffprobe the container for the format-level duration.
+    import subprocess
+
+    args = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(wav_path),
+    ]
+    try:
+        proc = subprocess.run(
+            args, check=False, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"could not measure VO duration: wave failed and ffprobe not on PATH "
+            f"({wav_path})"
+        ) from exc
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not out:
+        raise RuntimeError(
+            f"ffprobe could not read a duration for {wav_path} "
+            f"(exit {proc.returncode}, stderr tail: {proc.stderr[-200:]!r})"
+        )
+    try:
+        return float(out)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"ffprobe returned a non-numeric duration {out!r} for {wav_path}"
+        ) from exc
+
+
+def _warn_if_vo_over_duration(vo_path: Path, script: "ScriptDraft", config: dict) -> float | None:
+    """WARN (never halt) if the normalized VO is longer than the breakout target.
+
+    Runs right after Stage 7.5 loudnorm, when the normalized VO .wav is the final
+    spoken artifact. Reads `script_quality.duration_warn_s` (default 38.0); a value
+    of 0 (or negative) disables the check. This is deliberately warn-only: an
+    unattended `/start -auto` run must not deadlock on a fresh duration gate —
+    B1's word_count_max (98) bounds the tail, and this surfaces the real measured
+    overrun for the next cycle to tighten the script.
+
+    Returns the measured duration in seconds, or None when the check is disabled.
+    Never raises on a measurement failure — a duration probe must not break the
+    render path; it logs and returns None instead.
+    """
+    qcfg = config.get("script_quality", {}) or {}
+    warn_s = float(qcfg.get("duration_warn_s", 38.0))
+    if warn_s <= 0:
+        return None
+    try:
+        duration = _probe_wav_duration_seconds(vo_path)
+    except RuntimeError as exc:  # noqa: BLE001 — duration probe is advisory; never break render
+        log.warning("could not measure VO duration for %s (%s); skipping duration WARN",
+                    vo_path.name, exc)
+        return None
+    if duration > warn_s:
+        log.warning(
+            "VO duration %.1fs exceeds the %.1fs breakout target (script ~%d words) "
+            "— tighten the script next cycle",
+            duration, warn_s, script.word_count,
+        )
+    else:
+        log.info("VO duration %.1fs within the %.1fs breakout target", duration, warn_s)
+    return duration
 
 
 def _format_ass_time(seconds: float) -> str:
@@ -1925,12 +2796,25 @@ def _generate_captions_legacy(vo_path: Path, script: ScriptDraft, config: dict) 
     return captions_path
 
 
+def _master_output_path(config: dict, topic_id: str) -> Path:
+    """Canonical master path: ``<channel_root>/04_renders/_final_master/<topic_id>_master.mp4``.
+
+    Shared by ``render_master`` (the encode target) and the ``RenderLock``
+    orphan guard in ``run_for_topic`` so both agree on the file name without
+    duplicating the path formula.
+    """
+    out_dir = Path(config["paths"]["channel_root"]) / "04_renders" / "_final_master"
+    return out_dir / f"{topic_id}_master.mp4"
+
+
 def render_master(
     script: ScriptDraft,
     assets: AssetBundle,
     vo_path: Path,
     captions_path: Path,
     config: dict,
+    *,
+    force_encoder: str | None = None,
 ) -> Path:
     """Stage 6: FFmpeg assembly into a 1080×1920 H.264 master.
 
@@ -1941,6 +2825,12 @@ def render_master(
       - Each clip is scaled (cover) and center-cropped to 1080×1920.
       - The concat'd video gets the ASS subtitles filter applied for burned-in captions.
       - Final mux: video + VO audio, encoded H.264 (NVENC if config.render.hardware_accel='nvenc').
+
+    Args:
+      force_encoder: when set (e.g. "libx264"), override the encoder choice from
+        config.render.hardware_accel. Used by _render_with_integrity_retry() to
+        force a libx264 re-render after a suspected NVENC silent-corruption
+        event. None (default) preserves the config-driven choice.
 
     Windows path note: the ASS/subtitles filter struggles with drive-letter colons in
     its filename argument. We work around it by running ffmpeg with cwd set to the
@@ -1992,13 +2882,27 @@ def render_master(
     # 4. Audio is just the VO at its original sample rate.
     audio = ffmpeg.input(str(vo_path)).audio
 
-    # 5. Output path under 04_renders\_final_master\
-    out_dir = Path(config["paths"]["channel_root"]) / "04_renders" / "_final_master"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    master_path = out_dir / f"{script.topic_id}_master.mp4"
+    # 5. Output path under 04_renders\_final_master\. Encode to a sibling
+    #    `.part` file and atomically promote to the canonical master name ONLY
+    #    after the smoke-decode check passes. Crash-safety: a killed/detached
+    #    render never leaves a half-written file at the master path, so resume
+    #    always re-renders cleanly and no partial can masquerade as "done".
+    master_path = _master_output_path(config, script.topic_id)
+    master_path.parent.mkdir(parents=True, exist_ok=True)
+    from tools.render_lock import part_path_for
 
-    use_nvenc = config["render"].get("hardware_accel") == "nvenc"
-    vcodec = "h264_nvenc" if use_nvenc else "libx264"
+    part_path = part_path_for(master_path)
+
+    # `force_encoder` (used by _render_with_integrity_retry on integrity failure)
+    # overrides the config-driven NVENC choice. "libx264" forces software encode.
+    if force_encoder:
+        use_nvenc = force_encoder == "h264_nvenc"
+        vcodec = force_encoder
+        if force_encoder == "libx264":
+            log.warning("render: force_encoder=libx264 (overriding config); software encode")
+    else:
+        use_nvenc = config["render"].get("hardware_accel") == "nvenc"
+        vcodec = "h264_nvenc" if use_nvenc else "libx264"
 
     out_kwargs: dict = {
         "vcodec": vcodec,
@@ -2008,6 +2912,15 @@ def render_master(
         "ar": 48000,
         "ac": 2,                # R7: stereo upmix from mono VO; prepublish_qa #7 expects 2.
         "movflags": "+faststart",
+        # Encode target is the lock's `.part` sidecar (see part_path_for), whose
+        # `.mp4.part` extension ffmpeg cannot map to a muxer — it errors out at
+        # AVFormatContext init ("Unable to choose an output format ... use a
+        # standard extension or specify the format manually"). Pin the muxer
+        # explicitly so output-container selection never depends on the
+        # filename. Propagates to all three .output() calls below (primary +
+        # both libx264 retries) via **out_kwargs. The atomic promote to the
+        # canonical `.mp4` happens after a clean encode.
+        "f": "mp4",
         "t": audio_duration,
         "shortest": None,
     }
@@ -2022,7 +2935,7 @@ def render_master(
     log.info("render: encoding to %s (vcodec=%s, %dkbps)", master_path.name, vcodec, bitrate_k)
     cmd_args = (
         ffmpeg
-        .output(concat_v, audio, str(master_path), **out_kwargs)
+        .output(concat_v, audio, str(part_path), **out_kwargs)
         .overwrite_output()
         .compile()
     )
@@ -2035,14 +2948,20 @@ def render_master(
     )
     if result.returncode != 0:
         log.error("ffmpeg failed (returncode=%d):\n%s", result.returncode, (result.stderr or "")[-3000:])
-        # Retry once with libx264 if NVENC was the issue
-        if use_nvenc and ("nvenc" in (result.stderr or "").lower() or "no nvenc" in (result.stderr or "").lower()):
-            log.warning("NVENC failed; retrying with libx264")
+        # Retry once with libx264 whenever the NVENC attempt failed. The prior
+        # gate keyed on stderr literally containing "nvenc", which silently
+        # skipped the fallback for encoder failures that don't name the encoder
+        # (driver/session-init/OOM errors — and the format-selection error that
+        # used to fail here). libx264 is the safe software fallback, so fall back
+        # on ANY non-zero NVENC encode; a genuine non-encoder problem just fails
+        # again and raises below with the libx264 stderr.
+        if use_nvenc:
+            log.warning("NVENC encode failed (rc=%d); retrying with libx264", result.returncode)
             out_kwargs["vcodec"] = "libx264"
             out_kwargs["preset"] = "fast"
             cmd_args = (
                 ffmpeg
-                .output(concat_v, audio, str(master_path), **out_kwargs)
+                .output(concat_v, audio, str(part_path), **out_kwargs)
                 .overwrite_output()
                 .compile()
             )
@@ -2054,9 +2973,184 @@ def render_master(
                 f"Stderr tail:\n{(result.stderr or '')[-2000:]}"
             )
 
-    size_mb = master_path.stat().st_size / 1e6
-    log.info("master rendered: %s (%.1f MB, %.1fs)", master_path.name, size_mb, audio_duration)
+    size_mb = part_path.stat().st_size / 1e6
+    log.info("render: encoded %s (%.1f MB, %.1fs); verifying before promote",
+             master_path.name, size_mb, audio_duration)
+
+    # Stage 6.1 (belt-and-suspenders): a 3-frame decode probe immediately after
+    # render. Catches NVENC silent-corruption (rc=0 + NAL-corrupt master) before
+    # Stage 10.1's deeper check. If it fails AND we just used NVENC, swap to
+    # libx264 inline using the same retry shape as the rc-fail branch above.
+    if not _decode_smoke_check(part_path):
+        log.error(
+            "render: smoke-decode-check FAILED on %s (encoder=%s); attempting libx264 retry",
+            master_path.name, vcodec,
+        )
+        if use_nvenc:
+            log.warning(
+                "render: NVENC produced rc=0 but NAL-corrupt output; re-encoding with libx264"
+            )
+            out_kwargs["vcodec"] = "libx264"
+            out_kwargs["preset"] = "fast"
+            cmd_args = (
+                ffmpeg
+                .output(concat_v, audio, str(part_path), **out_kwargs)
+                .overwrite_output()
+                .compile()
+            )
+            retry_result = subprocess.run(
+                cmd_args, cwd=str(captions_path.parent),
+                capture_output=True, text=True,
+            )
+            if retry_result.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg libx264 retry after smoke-check fail returned "
+                    f"rc={retry_result.returncode}. "
+                    f"Stderr tail:\n{(retry_result.stderr or '')[-2000:]}"
+                )
+            if not _decode_smoke_check(part_path):
+                raise RuntimeError(
+                    f"render: smoke-decode-check still FAILED after libx264 retry "
+                    f"on {part_path}"
+                )
+            size_mb = part_path.stat().st_size / 1e6
+            log.info(
+                "render: re-encoded (libx264 retry) %s (%.1f MB, %.1fs); verifying before promote",
+                master_path.name, size_mb, audio_duration,
+            )
+        else:
+            raise RuntimeError(
+                f"render: smoke-decode-check FAILED on {part_path} (encoder={vcodec}; "
+                f"no NVENC retry path available)"
+            )
+
+    # Atomic promote: the `.part` passed the smoke-decode check, so swap it into
+    # the canonical master name in a single os.replace (atomic on the same
+    # volume). Only now does a file exist at master_path — a render killed at any
+    # point before this line leaves only the `.part`, never a half-written master.
+    os.replace(part_path, master_path)
+    final_mb = master_path.stat().st_size / 1e6
+    log.info("master rendered: %s (%.1f MB, %.1fs)", master_path.name, final_mb, audio_duration)
+
     return master_path
+
+
+def _decode_smoke_check(master_path: Path) -> bool:
+    """Stage 6.1 belt-and-suspenders: 3-frame decode probe on a freshly rendered master.
+
+    Returns True if ffmpeg can decode the first 3 video frames cleanly (rc=0),
+    False otherwise. Designed to catch NVENC silent corruption (rc=0 + NAL-
+    corrupt output) before Stage 10.1's deeper decode probe runs. This is a
+    cheap O(100ms) probe that complements `_check_media_integrity()` rather
+    than replacing it.
+
+    Implementation: `ffmpeg -i <master> -frames:v 3 -f null -`. Any non-zero
+    exit code is treated as corruption. Missing-file is also False (caller
+    decides whether that warrants a retry vs an immediate halt).
+    """
+    import subprocess
+
+    if not master_path.exists():
+        log.error("smoke-decode-check: master does not exist: %s", master_path)
+        return False
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(master_path),
+             "-frames:v", "3", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        log.error("smoke-decode-check: ffmpeg timed out on %s", master_path)
+        return False
+    except FileNotFoundError:
+        # ffmpeg not on PATH; can't probe. Fail-safe: return True so we don't
+        # block renders in environments without ffmpeg (caller's render would
+        # have already failed earlier).
+        log.warning("smoke-decode-check: ffmpeg not on PATH; skipping probe")
+        return True
+    if proc.returncode != 0:
+        log.error(
+            "smoke-decode-check FAIL on %s (rc=%d): %s",
+            master_path.name, proc.returncode, (proc.stderr or "")[-500:],
+        )
+        return False
+    return True
+
+
+def _render_with_integrity_retry(
+    script: "ScriptDraft",
+    assets: "AssetBundle",
+    vo_path: Path,
+    captions_path: Path,
+    config: dict,
+    *,
+    max_retries: int = 1,
+) -> Path:
+    """Wrap render_master() + Stage 10.1 integrity check with a single libx264 retry.
+
+    Defense against NVENC silent corruption (rc=0 + NAL-corrupt master):
+      1. Run render_master() with config-driven encoder.
+      2. Run _check_media_integrity(stage="post-master").
+      3. If IntegrityCheckFailed fires AND we have retries left, rename the
+         broken master to <master>.nvenc-corrupt.mp4 for postmortem evidence
+         and re-invoke render_master(force_encoder="libx264"). Re-check.
+      4. On second failure, re-raise the IntegrityCheckFailed.
+
+    Returns the path to the integrity-verified master.
+    """
+    attempt = 0
+    last_exc: IntegrityCheckFailed | None = None
+    force_encoder: str | None = None
+
+    while attempt <= max_retries:
+        master_path = render_master(
+            script, assets, vo_path, captions_path, config,
+            force_encoder=force_encoder,
+        )
+        log.info("master rendered: %s", master_path)
+        try:
+            _check_media_integrity(master_path, stage="post-master")
+            # Canonical OK line — /start -auto greps for this exact prefix
+            # before dropping <topic_id>_master_QA_APPROVED.marker.
+            log.info("Stage 10.1 OK on %s", master_path.name)
+            return master_path
+        except IntegrityCheckFailed as exc:
+            last_exc = exc
+            attempt += 1
+            if attempt > max_retries:
+                log.error(
+                    "render+integrity: %d retries exhausted on %s; re-raising",
+                    max_retries, master_path.name,
+                )
+                raise
+            # Rename the corrupt master so it's preserved for postmortem.
+            corrupt_path = master_path.with_suffix(
+                master_path.suffix + ".nvenc-corrupt.mp4"
+            )
+            try:
+                if corrupt_path.exists():
+                    corrupt_path.unlink()
+                master_path.rename(corrupt_path)
+                log.warning(
+                    "render+integrity: preserved corrupt master at %s",
+                    corrupt_path,
+                )
+            except OSError as rename_exc:
+                log.error(
+                    "render+integrity: failed to rename corrupt master %s -> %s: %s",
+                    master_path, corrupt_path, rename_exc,
+                )
+            log.warning(
+                "render+integrity: integrity check failed on attempt %d (%s); "
+                "retrying with force_encoder=libx264",
+                attempt, exc.reason,
+            )
+            force_encoder = "libx264"
+
+    # Defensive — loop always returns or raises above, but mypy/lint clarity.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("_render_with_integrity_retry: unreachable")
 
 
 def await_final_qa(master_path: Path, config: dict) -> bool:
@@ -2176,7 +3270,7 @@ def generate_variants(master_path: Path, config: dict) -> dict[Platform, Path]:
 
 
 _METADATA_SECTION_RE = re.compile(
-    r"(?:^|\n)\s*(?:##\s*)?(YOUTUBE\s*SHORTS|TIKTOK|INSTAGRAM\s*REELS|COVER(?:\s*/\s*THUMBNAIL(?:\s+CONCEPT)?)?)"
+    r"(?:^|\n)\s*(?:##\s*)?(YOUTUBE\s*SHORTS|TIKTOK|INSTAGRAM\s*REELS|COVER(?:\s*/\s*THUMBNAIL(?:\s+CONCEPT)?)?|PINNED\s*COMMENT)"
     r"\s*:?\s*\n",
     re.IGNORECASE,
 )
@@ -2248,6 +3342,12 @@ def _parse_metadata_response(response: str, topic_id: str) -> MetadataBundle:
         or sections.get("COVER / THUMBNAIL", "")
         or sections.get("COVER / THUMBNAIL CONCEPT", "")
     )
+    # PINNED COMMENT (PU-2, optional). Free-form single line — no Label: sub-field,
+    # so take the whole section body trimmed. Recognized as a section boundary by
+    # _METADATA_SECTION_RE so it can no longer bleed into the COVER accent field.
+    # Strip a leading "- " bullet the LLM may emit.
+    pc = sections.get("PINNED COMMENT", "").strip()
+    pc = re.sub(r"^[-*]\s+", "", pc).strip()
 
     missing = [name for name, text in [("YOUTUBE SHORTS", yt), ("TIKTOK", tt),
                                         ("INSTAGRAM REELS", ig), ("COVER", cv)] if not text]
@@ -2283,7 +3383,34 @@ def _parse_metadata_response(response: str, topic_id: str) -> MetadataBundle:
             or _md_section_field(cv, "Accent")
         ),
         cover_pattern_name=pattern_name,
+        pinned_comment=pc,
     )
+
+
+def _enforce_metadata_hard_rules(bundle: MetadataBundle, config: dict) -> None:
+    """Run the config-flagged metadata hard rules; raise MetadataRuleViolation
+    (a halt) with feedback when any are broken.
+
+    Flag (default OFF so legacy configs keep legacy behavior; production
+    config.yaml + template set it true — one-flip rollback):
+      - script_quality.title_anchor_gate_enabled (PU-3T) — the de-facto-thumbnail
+        TITLE anchor (first 3 words). Complements the PU-3 spoken-body anchor
+        gate, which by design cannot see the title (it doesn't exist at Stage 1.5).
+    """
+    qcfg = config.get("script_quality") or {}
+    violations: list[str] = []
+
+    if bool(qcfg.get("title_anchor_gate_enabled", False)):
+        v = title_anchor_violation(bundle.youtube_title)
+        if v:
+            violations.append(f"title anchor (PU-3T): {v}")
+
+    if violations:
+        log.error(
+            "metadata hard-rule violation(s) on %s: %s",
+            bundle.topic_id, "; ".join(violations),
+        )
+        raise MetadataRuleViolation(topic_id=bundle.topic_id, violations=violations)
 
 
 def generate_metadata(script: ScriptDraft, config: dict) -> MetadataBundle:
@@ -2309,7 +3436,9 @@ def generate_metadata(script: ScriptDraft, config: dict) -> MetadataBundle:
     prompt = template.replace("{NICHE_STYLE_GUIDE}", style_guide).replace("{SCRIPT}", script_text)
 
     response = _await_manual_response(prompt, "metadata", script.topic_id, config)
-    return _parse_metadata_response(response, script.topic_id)
+    bundle = _parse_metadata_response(response, script.topic_id)
+    _enforce_metadata_hard_rules(bundle, config)
+    return bundle
 
 
 def generate_thumbnail(metadata: MetadataBundle, config: dict) -> Path:
@@ -2394,24 +3523,70 @@ def run_for_topic(topic: TopicJob, config: dict) -> None:
     # before captions and render. In-place rewrite of vo_path.
     vo_path = _normalize_vo_loudness(vo_path, config)
 
-    captions_path = generate_captions(vo_path, script, config)
+    # Post-Stage-7.5: the normalized VO is the final spoken artifact, so measure
+    # its real duration and WARN (never halt) if it overruns the <=38s breakout
+    # target. Warn-only by design — unattended /start -auto must not deadlock.
+    _warn_if_vo_over_duration(vo_path, script, config)
 
-    # Stage 8.5 (Sprint 5 Layer 3): caption-side template-artifact double-check.
-    # Catches the _12_002 failure class: edge-TTS spoke a literal template
-    # annotation aloud, word-pop transcribed it back into the .ass file, and
-    # without this gate the artifact would have been burned into the render.
-    # Halts via PipelineQAFailed — same semantics as Stage 11.
-    _check_captions_for_template_artifacts(captions_path, script.topic_id)
+    from tools.gpu_lock import gpu_lock_from_config
 
-    master_path = render_master(script, assets, vo_path, captions_path, config)
-    log.info("master rendered: %s", master_path)
+    # GPU semaphore (H-4, 2026-06-19 review): the two parallel /start -auto
+    # topics each run whisper-large-v3 (captions) + NVENC (render). On the 6 GB
+    # card those can collide and OOM/thrash. This machine-wide lock serializes
+    # the GPU span (captions through render) across topics; the non-GPU stages
+    # still overlap. No-op when render.gpu_lock_enabled is false (default) or
+    # uncontended (a single video acquires it instantly).
+    with gpu_lock_from_config(config, script.topic_id):
+        captions_path = generate_captions(vo_path, script, config)
 
-    # Stage 10.1: structural integrity gate on the master (catches truncated MP4s
-    # and missing-moov failures before the operator's gate-3 review).
-    _check_media_integrity(master_path, stage="post-master")
-    # Canonical OK line — /start -auto greps the per-run log for this exact
-    # prefix before dropping <topic_id>_master_QA_APPROVED.marker.
-    log.info("Stage 10.1 OK on %s", master_path.name)
+        # Stage 8.5 (Sprint 5 Layer 3): caption-side template-artifact double-check.
+        # Catches the _12_002 failure class: edge-TTS spoke a literal template
+        # annotation aloud, word-pop transcribed it back into the .ass file, and
+        # without this gate the artifact would have been burned into the render.
+        # Halts via PipelineQAFailed — same semantics as Stage 11.
+        _check_captions_for_template_artifacts(captions_path, script.topic_id)
+
+        # Stage 6 + 10.1: render, then deep-decode integrity check, with a single
+        # libx264 retry on integrity failure (NVENC silent-corruption defense).
+        #
+        # The render is held under a RenderLock (heartbeat + atomic `.part` write).
+        # If a previous invocation's render was detached/killed mid-encode — the
+        # recurring cycle-24 / 2026-06-05 sub-agent-backgrounding footgun — its lock
+        # is detected here as orphaned (stale heartbeat or dead PID), logged loudly,
+        # its partial `.part` cleaned, and the render resumes cleanly with no manual
+        # apex rescue and no silent freeze. A genuinely-live concurrent render is
+        # waited on (then stolen if it goes stale) rather than double-encoded. The
+        # lock records the launching argv so `tools/render_reaper.py` can replay an
+        # orphaned render foreground. Keeps idempotent-resume + config isolation +
+        # the NVENC→libx264 fallback intact.
+        from tools.render_lock import RenderLock
+
+        master_out = _master_output_path(config, script.topic_id)
+
+        # Re-render skip-guard (CODE_AUDIT item (e)): if an approved, structurally
+        # intact master already exists, skip the encode entirely. Pure early-exit
+        # ABOVE the RenderLock so a no-op re-run doesn't even contend the render
+        # lock. Downstream Stage 10.1 / 11 still re-verify the master/variants, so
+        # this only ever avoids redundant work — it never promotes a file. Delete
+        # the marker or the master to force a re-render.
+        if _approved_master_intact(master_out, config):
+            log.info(
+                "render skipped: approved master intact (%s); delete the marker or master "
+                "to force re-render",
+                master_out,
+            )
+            master_path = master_out
+        else:
+            with RenderLock(
+                master_out,
+                topic_id=script.topic_id,
+                argv=list(sys.argv),
+                cwd=os.getcwd(),
+                executable=sys.executable,
+            ):
+                master_path = _render_with_integrity_retry(
+                    script, assets, vo_path, captions_path, config,
+                )
 
     await_final_qa(master_path, config)  # halts pipeline
 
@@ -2432,6 +3607,51 @@ def run_for_topic(topic: TopicJob, config: dict) -> None:
 # ---------------------------------------------------------------------------
 # Stage 10.1 / 11 helpers — integrity + prepublish QA
 # ---------------------------------------------------------------------------
+
+
+def _approved_master_intact(master_out: Path, config: dict) -> bool:
+    """Return True iff an approved, structurally-intact master already exists.
+
+    Used as a pure, read-only pre-check ABOVE the RenderLock so a re-run of an
+    already-finished topic skips the ~1-2 min re-encode. All three must hold:
+      1. the final master file exists,
+      2. its gate-3 marker `<stem>_QA_APPROVED.marker` exists (same construction
+         as `await_final_qa`), and
+      3. `tools.media_integrity.check_integrity` passes on the master (so a
+         truncated/bit-rotten cold-archive master — the integrity_sweep failure
+         class — is NOT silently accepted as a skip).
+
+    Gated by `config.render.skip_if_approved_master` (default False here for
+    legacy safety; production config.yaml(.template) turns it ON). Never raises:
+    an integrity failure (or any probe error) returns False so the caller falls
+    through to a normal re-render rather than halting. This function ONLY ever
+    AVOIDS work — it never promotes a file or mutates state.
+    """
+    if not bool(config.get("render", {}).get("skip_if_approved_master", False)):
+        return False
+    if not master_out.exists():
+        return False
+    marker = master_out.parent / f"{master_out.stem}_QA_APPROVED.marker"
+    if not marker.exists():
+        return False
+    from tools.media_integrity import MediaIntegrityError, check_integrity
+
+    try:
+        check_integrity(master_out)
+    except (FileNotFoundError, MediaIntegrityError) as exc:
+        log.warning(
+            "render skip-guard: master %s has gate-3 marker but FAILED integrity (%s) "
+            "— will re-render",
+            master_out.name, exc,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — skip-guard must never break the render path
+        log.warning(
+            "render skip-guard: integrity probe errored on %s (%s) — will re-render",
+            master_out.name, exc,
+        )
+        return False
+    return True
 
 
 def _check_media_integrity(video_path: Path, *, stage: str) -> dict:
@@ -2568,7 +3788,7 @@ def _run_prepublish_qa(
                 platform, len(failures), sorted(failures.keys()),
             )
         else:
-            log.info("Stage 11 OK on %s (%d checks ran)", platform, report.checks_run)
+            log.info("Stage 11 OK on %s for %s (%d checks ran)", platform, topic_id, report.checks_run)
 
     if aggregated_failures:
         # Flatten: prefix each check_id with the platform so the operator can
@@ -2607,6 +3827,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = load_config(Path(args.config) if args.config else None)
+    validate_config(config)  # M4: fail fast on missing keys before any stage runs
     setup_logging(config, _build_run_id(args.topic_id))
 
     topic = TopicJob(id=args.topic_id, topic=args.topic, angle=args.angle, hook_concept=args.hook)

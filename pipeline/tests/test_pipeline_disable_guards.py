@@ -191,6 +191,63 @@ class TestScriptQualityGuard:
 
 
 # ---------------------------------------------------------------------------
+# Stage 1.5 — require_full_dimensions (H-3, 2026-06-19)
+# ---------------------------------------------------------------------------
+
+
+class TestRequireFullDimensions:
+    """require_full_dimensions scores over ALL canonical dimensions (missing =
+    0.0), closing the scorer-controlled-denominator exploit and making a missing
+    QUALITY_SCORES section halt under enforce instead of silently passing."""
+
+    def _cfg(self) -> dict:
+        return {"script_quality": {
+            "min_score": 0.50,
+            "enforce_min_score": True,
+            "require_full_dimensions": True,
+        }}
+
+    def test_all_dimensions_present_high_passes(self) -> None:
+        script = _make_script()  # all 1.0
+        assert evaluate_script_quality(script, self._cfg()) is script
+
+    def test_omitting_weak_dimensions_cannot_inflate(self) -> None:
+        """Only the 2 strong dims present at 1.0; the other 4 count as 0.0 ->
+        mean 2/6 = 0.33 < 0.50 -> halts. Under the legacy mean-over-present this
+        same script scored 1.0 and passed."""
+        two = {SCRIPT_QUALITY_DIMENSIONS[0]: 1.0, SCRIPT_QUALITY_DIMENSIONS[1]: 1.0}
+        script = _make_script(scores=two)
+        with pytest.raises(pipeline.QualityCheckFailed):
+            evaluate_script_quality(script, self._cfg())
+
+    def test_no_quality_scores_section_halts_under_enforce(self) -> None:
+        """An empty QUALITY_SCORES dict scores 0.0 across the board -> halt,
+        instead of the legacy silent pass-through."""
+        script = _make_script(scores={})
+        with pytest.raises(pipeline.QualityCheckFailed):
+            evaluate_script_quality(script, self._cfg())
+
+    def test_legacy_default_still_averages_over_present(self) -> None:
+        """With require_full_dimensions unset (default False), the same 2-strong-
+        dims script averages over present only -> 1.0 -> passes. Pins that the
+        flag (not some unrelated change) is what closes the exploit."""
+        two = {SCRIPT_QUALITY_DIMENSIONS[0]: 1.0, SCRIPT_QUALITY_DIMENSIONS[1]: 1.0}
+        script = _make_script(scores=two)
+        config = {"script_quality": {"min_score": 0.50, "enforce_min_score": True}}
+        assert evaluate_script_quality(script, config) is script
+
+    def test_full_dimensions_ok_log_line_still_emitted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The canonical 'Stage 1.5 OK' canary still fires in require_full mode."""
+        script = _make_script()  # all 1.0
+        with caplog.at_level("INFO", logger="pipeline"):
+            evaluate_script_quality(script, self._cfg())
+        joined = " | ".join(r.getMessage() for r in caplog.records)
+        assert "Stage 1.5 OK" in joined
+
+
+# ---------------------------------------------------------------------------
 # Canonical OK log lines (canary for /start -auto's assertion grep)
 # ---------------------------------------------------------------------------
 

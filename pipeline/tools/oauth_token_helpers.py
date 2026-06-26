@@ -29,6 +29,7 @@ No new dependencies.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,6 +104,29 @@ def log_token_expiry_health(creds: Credentials, *, logger: logging.Logger) -> No
         logger.info("%s", msg)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically (temp sibling + os.replace).
+
+    os.replace is atomic on the same filesystem (including Windows), so a
+    concurrent reader — e.g. the OTHER /start -auto sub-agent loading the token
+    at the same moment — never sees a half-written file, and two concurrent
+    refreshes resolve to last-writer-wins on a COMPLETE token rather than a torn
+    one (audit M-10 / R2). The temp name carries the PID so two concurrent
+    writers don't clobber each other's in-progress temp. On a failure the temp
+    sibling is best-effort cleaned up.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def refresh_with_translation(
     creds: Credentials,
     *,
@@ -138,5 +162,5 @@ def refresh_with_translation(
         logger.error("%s", msg)
         raise RuntimeError(msg) from exc
 
-    token_path.write_text(creds.to_json(), encoding="utf-8")
+    _atomic_write_text(token_path, creds.to_json())
     logger.info("OAuth token refreshed and persisted to %s", token_path)

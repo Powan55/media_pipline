@@ -3,6 +3,10 @@
   "_default_priors_set_at": "2026-05-05",
   "_tuning_history": [],
 
+  "_corporate_deal_doc": "NON-component tuning (2026-06-11, CODE_AUDIT item (d)): damp the ai_vendor + named_human bonuses and apply a flat penalty when a candidate carries FINANCIAL corporate-deal language (IPO / S-1 / funding round / raises $ / valuation / acquisition / merger / SPAC / series A-F / investors). These two keys sit OUTSIDE the 8 normalized component weights (load_weights ignores them), so the PU-10 governance HOLD on the component numbers and the sum-to-1.0 normalization are both untouched. Loaded by scoring.load_corporate_deal_tuning(). Set bonus_damp=1.0 and penalty=0.0 to disable.",
+  "corporate_deal_bonus_damp": 0.25,
+  "corporate_deal_penalty": 0.10,
+
   "niche_fit": 0.18,
   "hook_strength": 0.15,
   "specificity": 0.18,

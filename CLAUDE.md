@@ -11,6 +11,8 @@
 
 **ShadowVerse** is a one-person faceless short-form AI/tech video channel. Goal: monetization-via-views. Audience: **general consumer curious about AI** (pivoted 2026-05-07 from "mid-career devs"). Format: 30-50 sec Shorts on YouTube → TikTok → Instagram, AI-vendor / AI-news / AI-product topics. **Visual format:** AI-VO over **stock + AI-generated B-roll** (no gameplay; 0% gameplay shipped historically per Agent A scan, and Agent G recommended against it — Daily Dot brain-rot fatigue + format mismatch with consumer-AI explainer per audit D1, 2026-05-08).
 
+**Dual-track second slot (added 2026-06-21; ENABLED by default since 2026-06-23, operator-directed).** The two daily slots run different tracks: slot 1 (11:25 AM ET) stays AI-vendor; slot 2 (12:35 PM ET) runs the **general-tech track** — broad consumer tech (iPhone/Meta/Windows/Tesla/Neuralink/gadgets) + **crazy-tech-story** human narratives ("a person did X with tech"). Active via `tracks.dual_track_enabled: true` + `news_rss.general_tech_feeds_enabled: true` in `config.yaml`; the AI-vendor track is byte-identical when off, so **one-flip rollback** (`dual_track_enabled: false`) reverts `/start -auto` to two AI-vendor picks. Do NOT flip it back off without operator direction. Crazy-stories pass a stricter truth gate (named protagonist + retrievable URL or dropped; no overclaims). Rollout + measurement gate (now a live evaluation checkpoint, not a blocker): `dual_track_plan.md`.
+
 The pipeline that makes the videos lives at `C:\ContentOps\_pipeline\` (its own git repo). Strategy + reference docs live here at `C:\Users\laxmi\Documents\Project\` (OneDrive-syncable). See `Channels\ShadowVerse\README.md` for affiliate slots and channel branding.
 
 ---
@@ -84,6 +86,11 @@ These come from operator's explicit prior decisions. Don't relitigate:
    - Manager reads at session start (chunk via offset/limit if needed — never delegate the read to dodge size limits) and writes at session end. Sub-agents receive only the targeted excerpts pasted into their prompts.
    - Rule is gated: relax only with explicit per-task operator approval. **Default-deny.**
 
+10. **Self-improving learn loop runs by default** (set 2026-06-24, operator-directed):
+    - The reach-first learning loop (`_pipeline/learning/`) is the project's **standing default**, not an opt-in. `/start -auto` runs it at step 2.5 on every run (rebuilds the ledger, runs the reach-first + right-tail analysis, feeds the top reach levers into idea-gen) — **no flag needed**.
+    - **`learning.apply_enabled: true` is the default** (`config.yaml` + template): the loop **auto-applies at most one bounded, reversible, non-sacred config knob per run** (word-count / `<38s` duration only), opened as a tracked experiment that **auto-reverts on regression**. It NEVER touches sacred gates or scoring-component weights (those stay PROPOSE-only via the weekly review).
+    - One-flip rollback: set `learning.apply_enabled: false` for report/propose-only (the loop still runs + shapes idea-gen; it just stops self-mutating config). See `project_self_improving_loop.md` + `project_analytics_deepdive_2026-06.md`.
+
 ---
 
 ## Folder layout
@@ -126,9 +133,21 @@ python daily_batch.py --n-target 5 --n-picks 2     # tighter pool
 python analytics_pull.py --all                     # all-time on every published video
 python analytics_pull.py --days 7                  # last 7 days
 
+# Compute publish slots for /start -auto (used internally by start.md)
+python tools/compute_publish_slots.py                       # next free day, both 11:25 AM + 12:35 PM ET slots
+python tools/compute_publish_slots.py --date 5/25/26        # explicit date, halts on collision
+python tools/compute_publish_slots.py --date 2026-05-25     # ISO form also accepted
+
 # YouTube upload (REQUIRES explicit per-video operator approval)
 python tools/youtube_upload.py --topic-id 2026-05-06_003 --privacy public
 python tools/youtube_upload.py --topic-id 2026-05-06_003 --privacy private --dry-run
+
+# TikTok upload (official Content Posting API; added 2026-06-24). Config-gated in /start -auto
+# via tiktok.upload_enabled (default OFF). Manual single-video path = /sv-upload-tiktok.
+# AUDIT WALL: an unaudited app posts SELF_ONLY only; mode:inbox lands in @shadowversetec drafts.
+python tools/tiktok_oauth_init.py                                  # one-time consent (then --force --with-publish post-audit)
+python tools/tiktok_upload.py --topic-id 2026-06-24_002 --dry-run  # verify inputs/caption, no API call
+python tools/tiktok_upload.py --topic-id 2026-06-24_002            # uses config defaults (mode/privacy)
 
 # Approve a master at gate 3 (operator only)
 New-Item C:\ContentOps\channels\ShadowVerse\04_renders\_final_master\<topic_id>_master_QA_APPROVED.marker
@@ -149,7 +168,7 @@ The handoff is a snapshot, not live state. The "Last updated" line at the bottom
 ## Workflows (slash commands)
 
 - **`/start`** — orientation only. Reads SESSION_HANDOFF + TODO, reports state, waits. Same as typing `start`.
-- **`/start -auto`** — fully autonomous daily run (added 2026-05-11). Analytics pull → idea-gen → script-gen → fact-check → render → Stage 11 QA → **auto-approve gate 3** → scheduled-Private upload for 18:30 EDT the next day → TODO.md cross-post entry → SESSION_HANDOFF.md activity-log line. Operator's review window moves to YouTube Studio. See `~/.claude/commands/start.md` for the full step-by-step. Halt conditions are mandatory: analytics fail, Stage 1.5 fail, Stage 10.1 fail, Stage 11 fail on any variant, or `youtube_upload.py` error → stop and surface to operator. Manual `daily_batch.py` invocations are unaffected; the gate-3 halt still fires for those.
+- **`/start -auto`** — fully autonomous daily run (added 2026-05-11; **dual-video shape since 2026-05-20**). Ships **TWO** videos per invocation, scheduled at **11:25 AM ET (slot 1)** and **12:35 PM ET (slot 2)** (moved to the midday audience-online peak 2026-06-24; were 5:25/6:35 PM). Apex runs shared steps once (analytics → `tools/compute_publish_slots.py` for next-free-day slot resolution → idea-gen pool with `--n-picks 2`), then dispatches two sub-agents in PARALLEL — each runs script-gen → fact-check → render → gate-3 marker → upload end-to-end for its own topic_id. Apex aggregates results and is the sole writer of TODO.md + SESSION_HANDOFF.md. Failure isolation: if one sub-agent halts, the other ships; whole-run halts only on shared-stage failures. Topic-to-slot: rank-1 → 11:25 AM, rank-2 → 12:35 PM. **Date override:** `/start -auto 5/25/26` (M/D/YY) or `/start -auto 2026-05-25` (ISO) schedules both videos for that explicit date; halts if either slot is occupied. See `~/.claude/commands/start.md` for the full step-by-step. Halt conditions are mandatory: analytics fail or slot-helper non-zero exit (whole-run); Stage 1.5 / 10.1 / 11 / `youtube_upload.py` non-zero (per-video). Manual `daily_batch.py` invocations are unaffected; the gate-3 halt still fires for those. See [`feedback_dual_video_pipeline.md`](C:\Users\laxmi\.claude\projects\C--Users-laxmi-Documents-Project\memory\feedback_dual_video_pipeline.md).
 
 ---
 

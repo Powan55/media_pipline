@@ -11,6 +11,7 @@ paths:
   shared:          C:\ContentOps\_shared
   models:          C:\ContentOps\_models
   channel_root:    C:\ContentOps\channels\ShadowVerse
+  project_root:    C:\Users\laxmi\Documents\Project
   logs:            C:\ContentOps\_pipeline\logs
   prompts:         C:\ContentOps\_pipeline\prompts
 
@@ -72,6 +73,39 @@ script_quality:
   # No LLM call — this is a fast post-parse check. See pipeline.evaluate_script_quality.
   min_score: 0.50                       # weighted-total threshold below which scripts halt
   enforce_min_score: true               # halt below threshold (flipped on 2026-05-06 after smoke-test scored 0.776, well above 0.50)
+  require_full_dimensions: true          # H-3 (2026-06-19 review): score over ALL canonical QUALITY_SCORES
+                                        # dimensions with a MISSING one counting as 0.0. Stops an LLM inflating
+                                        # its mean by omitting weak dimensions (scorer-controlled denominator),
+                                        # and makes a response with no QUALITY_SCORES section score 0.0 -> halt
+                                        # under enforce instead of silently passing. false = legacy tolerant
+                                        # gate (mean over present dims only). One-flip rollback.
+  # These bounds are read in TWO places: the Stage-1.5 word-count HALT
+  # (_enforce_script_hard_rules) and the _parse_script_response review WARN.
+  word_count_min: 75                    # lower bound on the parsed spoken-body word count (2026-06-11: 80 -> 75
+                                        # for headroom around the 80–95 prompt target so the Stage-1.5 capped-
+                                        # regenerate halt doesn't thrash on a slightly-short draft)
+  word_count_max: 98                    # upper bound — tightened 120 -> 98 (2026-06-11 word-budget recalibration:
+                                        # measured edge-tts cadence ~0.33–0.40 s/word; 114w rendered 45.0s and 119w
+                                        # 40.5s, both breaching the ≤38s breakout ceiling. 98 x 0.40 ≈ 39s hard
+                                        # ceiling; B2's duration WARN covers the tail. Set back to 200 to loosen.)
+  word_count_halt_enabled: true         # PU-11: Stage 1.5 HALTS on a word-count bound violation (capped
+                                        # regenerate-with-feedback, max 2 attempts, never auto-kill).
+                                        # false = legacy WARN-only. One-flip rollback.
+  anchor_gate_enabled: true             # PU-3 (2026-06-09 review, R2 H1): first 4 spoken words must carry a
+                                        # recognizable named anchor (person / brand / number / universal
+                                        # consumer concept). Halt + regenerate-with-feedback. One-flip rollback.
+  title_anchor_gate_enabled: true       # PU-3T (2026-06-24): the TITLE's first 3 words must carry a recognizable
+                                        # anchor (brand / person / number / vivid consumer object / "AI"), enforced
+                                        # at the metadata stage — the de-facto thumbnail (no custom thumbnails).
+                                        # Anchorless openers (dev-infra / abstract) fail. Halt + fix-re-run; one-flip.
+  modal_ban_enabled: true               # PU-4 (2026-06-09 review, R2 H2): modal/hypothetical openers
+                                        # (could / might / imagine if / what if) banned in sentence 1; the
+                                        # title-side ban lives in prompts/06_metadata_generation.md.
+                                        # Halt + regenerate-with-feedback. One-flip rollback.
+  duration_warn_s: 38.0                 # WARN-ONLY (2026-06-11): after Stage 7.5 loudnorm, the normalized VO's
+                                        # measured duration is the final spoken length. If it exceeds this many
+                                        # seconds, log a WARNING (never halt — unattended /start -auto must not
+                                        # deadlock on a fresh gate). The <=38s breakout reach lever. 0 disables.
 
 tts:
   provider: edge-tts                    # one of: "edge-tts", "elevenlabs", "f5-tts-local", "xtts-local"
@@ -152,6 +186,18 @@ render:
   audio_codec: aac
   video_codec: libx264
   hardware_accel: nvenc                 # NVIDIA GPU encoder; "none" to disable
+  skip_if_approved_master: true         # (2026-06-11) on a re-run, skip the encode when the final master EXISTS,
+                                        # its gate-3 <id>_master_QA_APPROVED.marker EXISTS, and media_integrity
+                                        # passes on it — saves ~1-2 min/topic. Pure early-exit ABOVE the RenderLock;
+                                        # downstream Stage 10.1/11 still re-verify. Delete the marker or master to
+                                        # force a re-render. false = always re-encode (legacy). One-flip rollback.
+  gpu_lock_enabled: true                # H-4 (2026-06-19 review): serialize the GPU span (whisper captions + NVENC
+                                        # render) ACROSS the two parallel /start -auto topics via a machine-wide
+                                        # lock, so two whisper-large-v3 loads don't exhaust the 6 GB card (OOM/thrash).
+                                        # Non-GPU stages still overlap; a single video acquires instantly. Crashed
+                                        # holder is auto-stolen after the staleness window (same heartbeat mechanism
+                                        # as RenderLock). false = no GPU serialization (legacy). One-flip rollback.
+  # gpu_lock_path: C:\ContentOps\_pipeline\.gpu.lock   # optional override; default is a machine-wide file in TEMP
 
 publishing:
   kill_switch: false                    # SAFETY — flip true to halt all auto-publish
@@ -163,6 +209,26 @@ publishing:
                                         # The flag here is documentation-only — actual gating is in chat.
                                         # See memory feedback_youtube_upload_policy.md for the full rule.
                                         # Cookie auth and third-party uploaders remain banned regardless.
+
+# --- TikTok auto-upload (added 2026-06-24) ---------------------------------
+# Posts the rendered TikTok variant (05_exports\tiktok\<id>_tt.mp4) via the
+# OFFICIAL Content Posting API (tools/tiktok_upload.py). Cookie auth + 3rd-party
+# uploaders are banned, same as YouTube.
+#
+# AUDIT WALL: an UNAUDITED app can only post SELF_ONLY (private) — on BOTH the
+# inbox and direct-post flows. PUBLIC posting requires this app to pass TikTok's
+# Content Posting API audit. Until then keep upload_enabled:false (manual
+# cross-post via TODO continues) OR mode:inbox (auto-push to drafts; finish in-app).
+#
+# ONE-FLIP ROLLBACK: upload_enabled:false makes /start -auto skip TikTok entirely.
+# start.md honors this flag. PHASE-2 FLIP (post-audit): upload_enabled:true +
+# mode:direct + privacy_level:PUBLIC_TO_EVERYONE -> fully-automated public, no code change.
+tiktok:
+  upload_enabled: false          # default OFF; /start -auto skips TikTok until flipped on
+  mode: inbox                    # inbox (pre-audit: lands in drafts, finish in-app) | direct (post-audit: auto-publish)
+  privacy_level: SELF_ONLY       # unaudited apps are FORCED to SELF_ONLY; set PUBLIC_TO_EVERYONE only after audit
+  video_made_with_ai: true       # we use AI VO + AI/stock B-roll; disclose accordingly (set in-app for inbox mode)
+  handle: shadowversetec         # the TikTok account (https://www.tiktok.com/@shadowversetec)
 
 trend_pull:
   # Reddit and YouTube data sources are DEFERRED — operator pulls trend data manually
@@ -188,9 +254,56 @@ trend_pull:
 analytics_pull:
   # Channel IDs / handles — fill in after creating the platform accounts.
   youtube_channel_id: <<TODO>>
-  tiktok_username:    <<TODO>>
+  tiktok_username:    shadowversetec
   instagram_username: <<TODO>>
   output_path: C:\ContentOps\channels\ShadowVerse\01_research\_weekly_analytics.csv
+
+# --- Dual-track topic engine (added 2026-06-21) ----------------------------
+# The second daily slot can draw from a GENERAL-TECH track (broad consumer tech +
+# crazy-tech-story lead) instead of a second AI-vendor pick. This whole block is
+# OPTIONAL — absent or disabled, the pipeline runs single-track exactly as before.
+#
+# ONE-FLIP ROLLBACK: set dual_track_enabled: false to revert /start -auto to two
+# AI-vendor picks. start.md honors this flag.
+tracks:
+  dual_track_enabled: true              # ENABLED 2026-06-23 (operator-directed): slot 2 = general-tech every /start -auto. Flip false for one-flip rollback to two AI-vendor picks.
+  general_tech:
+    weights_path: scoring_weights_general_tech.json  # per-track scoring profile (blank -> convention default)
+    idea_prompt: 02_idea_generation_general_tech      # idea-gen prompt name for this track
+    fact_check_prompt: 05_fact_check_general_tech      # apex sets fact_check.prompt to this in the GT sub-agent's isolated config
+    suppress_ai_vendor_bonus: true                     # don't reward AI-vendor mentions on the general-tech track
+    slot: 2                                             # pilot: GT -> slot 2 (12:35 PM ET, experimental); ai-vendor -> slot 1 (control)
+
+news_rss:
+  # Gate for the general-tech RSS poll (tools/news_rss_poller.py --track general-tech).
+  # The poller itself is config-free; the orchestration layer (start.md / the
+  # scheduled task) reads this flag to decide whether to run the general-tech poll.
+  general_tech_feeds_enabled: true   # ENABLED 2026-06-23 with dual_track_enabled: feed the general-tech RSS poll in /start -auto step 4d
+
+# --- Self-improving feedback loop (added 2026-06-23) ------------------------
+# Closed measurement loop: captures matured analytics, learns reach-first, and
+# AUTO-APPLIES ONLY reversible non-sacred config knobs within bounded deltas
+# (auto-reverting on regression). Sacred gates + scoring-component weights are
+# PROPOSE-only via the weekly review. The whole block is OPTIONAL — absent or
+# disabled, the pipeline runs exactly as before. The core is deterministic
+# Python statistics over data the pipeline already writes — no API, no agent
+# framework. See Documents/Project plan + _pipeline/learning/.
+learning:
+  enabled: true                 # master switch (telemetry capture + read-only analysis)
+  apply_enabled: true           # DEFAULT ON 2026-06-24 (operator-directed): the loop AUTO-APPLIES <=1
+                                # bounded, reversible, non-sacred knob/run during /start -auto, opened as a
+                                # tracked experiment with auto-rollback on regression. Sacred gates untouched.
+                                # Flip false for report/propose-only.
+  maturity_floor_days: 2        # only learn from videos this many days live (analytics need ~48h)
+  min_views_floor: 70           # a matured row needs >= this many views to count as a datapoint
+  min_sample: 5                 # minimum cohort size per feature before any auto-tune
+  retention_floor_pct: 25.0     # never auto-tune so that cohort-median avg_view_pct drops below this
+  max_active_experiments: 2     # global cap on simultaneously-open auto-experiments
+  max_auto_applies_per_cycle: 1 # at most this many safe knobs auto-applied per loop run
+  repair_csv_header: false      # OPERATOR-GATED: rewrite the legacy 12-col analytics header to the
+                                # canonical 15-col form. Default false — the loop reads correctly via a
+                                # positional loader regardless, so this is cosmetic for other DictReader
+                                # consumers. Touches the canonical analytics file; a .bak is taken.
 
 logging:
   level: INFO                           # DEBUG | INFO | WARNING | ERROR

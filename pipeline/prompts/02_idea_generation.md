@@ -26,13 +26,32 @@ Audience pivot (read this before scoring — set 2026-05-07 evening, hard pivot,
 
 The channel target viewer is now a **general consumer curious about AI** — the "Joe Schmo who uses ChatGPT to write a wedding speech" persona, not a developer. A regular non-coder must be able to understand the proposed video without any technical background. Goal is monetization-via-views; topic selection optimizes for view-magnetism, not dev-credibility.
 
+Cluster framing priority (added 2026-05-20 from analytics audit — cycles 1-13, 14 settled post-pivot videos):
+
+The post-pivot data shows three topic clusters consistently outperform the channel median (~325 views) by 2-4×. Bias your candidates STRONGLY toward these framings, and drop topics that fit the flop cluster.
+
+- **Cluster A — AI-with-agency (proven, 4-for-4 hits, mean 996 views):** the framing assigns autonomous behavior or human-like action to an AI. Use agency verbs: "pretended", "blackmailed", "shocked", "built", "escaped", "lied", "memorized", "dreamed", "decided", "tried to". Examples that hit: "Claude pretended to be the internet" (1,270 v), "Claude blackmailed engineers" (800 v).
+- **Cluster B — safety-horror / dramatic revelation (high variance, high upside):** named researcher / vendor employee + dramatic verb + safety or alignment angle. "Anthropic researcher quit after Claude lied to her" beats "Claude admits 25% of advice is flattery" (the weaker verb still got 307 v but capped low).
+- **Cluster C — famous-human × concrete AI demo (mean 815 views):** named authority (Bill Gates, Jamie Dimon, Mira Murati, Nobel laureate, Fields medalist, public CEO) + specific outcome + time/quantity. "Jamie Dimon: Claude built my dashboard in 20 minutes" (530 v), "ChatGPT 5.5 Pro shocked a Fields medalist" (1,183 v).
+
+**Drop cluster — corporate-deal framing (mean 155 views, dead floor):** partnership announcements, IPO/funding news, B2B/enterprise deals, generic vendor news ("OpenAI's new company", "Claude on AWS", "AIs dream while you sleep"). These framings have tanked across our shipped catalog. If a candidate's hook reads as a press-release recap, reject it or rewrite the angle until it fits Cluster A/B/C.
+
+When scoring `hook_strength` and `niche_fit`, treat cluster affinity as a primary signal: Cluster A/B/C-aligned hooks score 0.8–1.0; corporate-deal framings score 0.0–0.3.
+
 Topic-priority weighting:
 
-- **Preferred (general-audience AI):** ChatGPT, GPT-5 / GPT-N, Sora, DALL-E, OpenAI products, Claude (consumer features — Claude.ai, Claude apps), Anthropic news, Gemini, Google AI, Bard, Grok / xAI, AI agents in general, AI assistants, AI tools and apps a non-coder uses, AI news (vendor announcements, lawsuits, partnerships, viral AI moments). Anything a casual ChatGPT user would click on without needing dev context.
+- **Preferred (general-audience AI):** ChatGPT, GPT-5 / GPT-N, Sora, DALL-E, OpenAI products, Claude (consumer features — Claude.ai, Claude apps), Anthropic news, Gemini, Google AI, Bard, Grok / xAI, AI agents in general, AI assistants, AI tools and apps a non-coder uses, AI news (vendor announcements, lawsuits, viral AI moments). Anything a casual ChatGPT user would click on without needing dev context. (NOTE: "partnerships" is deliberately struck here — it belongs to the corporate-deal DROP cluster above, mean 155 v; do not treat a partnership/funding/IPO recap as a preferred topic.)
 - **Bridge-tier (acceptable ONLY if angled for non-coders):** Cursor, Aider, Cline, Copilot, Claude Code, MCP, RAG, agent frameworks. These are dev-tools; only acceptable when the title and angle land for a general audience without dev jargon. Example: "Aider 0.86 model arbitrage" → REJECT. "I asked AI to write code three different ways at once and they fought" → ACCEPT.
 - **Drop (do NOT propose):** uv, ruff, pip, poetry, generic linters, framework versions, language-runtime updates, IDE configuration files, dev-tool internals, package-manager comparisons. These are pure dev-infra and do not survive the audience pivot.
 
 Hard accessibility rule: if a regular ChatGPT-using consumer can't tell what the video is about by reading the proposed title in 2 seconds, the candidate is bad — drop it or rewrite the angle. Push this into the `niche_fit` score (see rubric below).
+
+Topic-selection litmus (added 2026-06-07, breakout analysis — REACH is the bottleneck, not retention; topic choice is one of the channel's biggest under-used reach levers). PREFER topics that pass BOTH tests, and DEPRIORITIZE topics that fail either:
+
+- (a) **Recognizable in the first line:** a non-AI person already recognizes a NAME, a BRAND, or a vivid concrete claim in the opening line (a famous human, ChatGPT/Claude/Gemini, or a specific startling outcome — not an abstract capability). If nobody outside the AI bubble would recognize anything in the first line, the topic under-reaches.
+- (b) **Plain-English "stakes-to-you" angle:** there is a clear what-this-means-for-the-viewer hook — their job, their photos, their money, their privacy, their everyday life. If the only payoff is "interesting if you follow AI," it fails.
+
+DEPRIORITIZE abstract-infrastructure topics that only land with people who already follow AI (model internals, agent plumbing, benchmark deltas with no human stake). Rationale [MEASURED]: the channel's high-retention / low-reach failures are 0-for-9 named-in-title and all abstract — "AI walks into your office" held 83% retention but earned only 78 views. Those topics retain the handful who watch but never earn the feed's expansion, so they cap at a dead floor. Reach comes from a recognizable subject + a personal stake, not from production quality or watch-time on the few who arrive.
 
 For each candidate, output as a JSON list with this exact shape:
 
@@ -85,6 +104,7 @@ Avoid:
 - Topics that require unverifiable benchmarks ("X is faster than Y" with no source)
 - **Topics that require dev jargon (CLI, refactor, MCP, lint, repo, env var, etc.) to land** — these tank reach for general audience
 - **Topics with no named-human cited observation retrievable today** (set 2026-05-12). Day-of vendor releases are acceptable only when (a) the script credits the vendor explicitly per the day-of-release exception in `style_guide.md` § Sources & citations, AND (b) a fresh third-party observation pull within the next 24h can upgrade the citation. Otherwise drop the candidate or defer it to the next batch. Anonymous "a developer says" / "a user reports" is rejected on sight — the 2026-05-12 cohort audit confirmed that vendor-only sourcing correlates with mid-tier views; the channel's top performers all carry a named human.
+- **Corporate-deal / press-release framings** (partnerships, funding rounds, B2B announcements, vendor PR recaps) — these consistently floor at 78–342 views in our catalog (mean 155). Rewrite into Cluster A/B/C or drop.
 
 Output strictly the JSON array with {N_TARGET} entries. No prose around it. The pipeline parses the JSON directly.
 ```

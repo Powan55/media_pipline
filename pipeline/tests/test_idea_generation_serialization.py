@@ -116,6 +116,8 @@ class TestAuditPayloadShape:
             "counter_conventional_bonus",
             "ai_vendor_bonus",
             "named_human_bonus",
+            "corporate_deal_damped",
+            "corporate_deal_penalty",
             "weighted_total",
             "rationale",
         }

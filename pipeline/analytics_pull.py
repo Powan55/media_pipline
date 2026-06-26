@@ -37,16 +37,39 @@ from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import httplib2
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
-from pipeline import load_config, setup_logging
+from pipeline import load_config, setup_logging, validate_config
 from tools.oauth_token_helpers import (
+    _FIX_COMMAND_POINTER,
     log_token_expiry_health,
     refresh_with_translation,
 )
 
 log = logging.getLogger("analytics_pull")
+
+# M2 (WORKFLOW_AUDIT_2026-05-31): the YouTube Data/Analytics calls had no
+# resilience knobs. num_retries gives googleapiclient's built-in exponential
+# backoff on transient 5xx/socket errors; a wall-clock socket timeout on the
+# transport is what actually prevents an unattended /start -auto run hanging
+# forever on a stalled connection (.execute() has NO timeout= kwarg). Both use
+# already-installed deps (google-api-python-client / google-auth-httplib2 /
+# httplib2) — no new pip line.
+YT_API_NUM_RETRIES = 3
+YT_API_TIMEOUT_S = 30
+
+
+def _timeout_http(creds: Credentials) -> AuthorizedHttp:
+    """Build an authorized httplib2 transport with a wall-clock socket timeout.
+
+    Pass the result as ``build(..., http=_timeout_http(creds))`` INSTEAD of
+    ``credentials=creds`` (the two are mutually exclusive — AuthorizedHttp
+    already carries the credentials).
+    """
+    return AuthorizedHttp(creds, http=httplib2.Http(timeout=YT_API_TIMEOUT_S))
 
 # Must mirror tools/youtube_oauth_init.py — this script reads tokens minted by
 # that script. If scopes change there, change them here too AND re-run the init
@@ -85,6 +108,11 @@ class VideoMetrics:
     follower_delta: int          # Analytics API: subscribersGained (lifetime-to-date)
     hold_at_3s: float | None = None             # ratio in [0, 1] or None
     traffic_source_shorts_pct: float | None = None  # ratio in [0, 1] or None
+    # M5 (WORKFLOW_AUDIT_2026-05-31): True when the per-video Analytics query
+    # FAILED (API/socket error) and the metrics fell back to zero. Lets a CSV
+    # consumer / the weekly review distinguish an API-error row (zeros that mean
+    # "unknown") from a genuinely-zero video. Additive, append-only — never reorder.
+    analytics_error: bool = False
 
 
 def _load_credentials() -> Credentials:
@@ -107,6 +135,15 @@ def _load_credentials() -> Credentials:
         )
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
     log_token_expiry_health(creds, logger=log)
+    # M3 (WORKFLOW_AUDIT_2026-05-31): catch a structurally-valid-but-wrong-scope
+    # token at load time (parity with youtube_upload.load_credentials) instead of
+    # letting it surface later as an untranslated HTTP 403 insufficientPermissions
+    # mid-pull. has_scopes() is a pure read; no scope-parsing re-implementation.
+    if not creds.has_scopes(SCOPES):
+        raise RuntimeError(
+            "OAuth token is missing one or more required scopes "
+            f"({', '.join(SCOPES)}). {_FIX_COMMAND_POINTER}"
+        )
     if creds.valid:
         return creds
     if creds.expired and creds.refresh_token:
@@ -120,19 +157,26 @@ def _load_credentials() -> Credentials:
 
 def _list_uploaded_videos(yt_data, channel_id: str, since: date) -> list[tuple[str, date]]:
     """Walk the channel's 'uploads' playlist; return (video_id, published_date)
-    for items with published_date >= since.
+    for items with published_date >= since. Ids are deduped (first occurrence
+    wins) — playlistItems.list pagination is not snapshot-consistent, so if
+    the playlist shifts between page fetches an item can repeat across a page
+    boundary while another is skipped (observed 2026-06-09: xf9HknOP4xs came
+    back twice and SVx9vjIp278 vanished within one pull).
 
     Note: the uploads playlist includes Private and Unlisted videos owned by
     the authenticated user — that's by design (we want analytics on everything
     we've published, including the gate-3-pending ruff video).
     """
-    ch_resp = yt_data.channels().list(part="contentDetails", id=channel_id).execute()
+    ch_resp = yt_data.channels().list(
+        part="contentDetails", id=channel_id
+    ).execute(num_retries=YT_API_NUM_RETRIES)
     items = ch_resp.get("items") or []
     if not items:
         raise RuntimeError(f"channel id {channel_id} not found via Data API")
     uploads_pl = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
     out: list[tuple[str, date]] = []
+    seen: set[str] = set()
     page_token: str | None = None
     while True:
         resp = yt_data.playlistItems().list(
@@ -140,7 +184,7 @@ def _list_uploaded_videos(yt_data, channel_id: str, since: date) -> list[tuple[s
             part="contentDetails",
             maxResults=50,
             pageToken=page_token,
-        ).execute()
+        ).execute(num_retries=YT_API_NUM_RETRIES)
         for item in resp.get("items", []):
             cd = item.get("contentDetails", {})
             vid = cd.get("videoId")
@@ -153,6 +197,14 @@ def _list_uploaded_videos(yt_data, channel_id: str, since: date) -> list[tuple[s
                 log.warning("skipping video %s: unparseable publishedAt %r", vid, ts)
                 continue
             if pub >= since:
+                if vid in seen:
+                    log.warning(
+                        "duplicate video id %s across playlist pages "
+                        "(playlist shifted mid-walk?) — keeping first occurrence",
+                        vid,
+                    )
+                    continue
+                seen.add(vid)
                 out.append((vid, pub))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -199,7 +251,7 @@ def _query_hold_at_3s(
             metrics="audienceWatchRatio",
             dimensions="elapsedVideoTimeRatio",
             filters=f"video=={video_id}",
-        ).execute()
+        ).execute(num_retries=YT_API_NUM_RETRIES)
     except Exception as e:
         log.warning("audienceWatchRatio query failed for %s: %s", video_id, e)
         return None
@@ -245,7 +297,7 @@ def _query_traffic_source_shorts_pct(
             metrics="views",
             dimensions="insightTrafficSourceType",
             filters=f"video=={video_id}",
-        ).execute()
+        ).execute(num_retries=YT_API_NUM_RETRIES)
     except Exception as e:
         log.warning("insightTrafficSourceType query failed for %s: %s", video_id, e)
         return None
@@ -279,8 +331,12 @@ def pull_youtube_analytics(creds: Credentials, channel_id: str, since: date) -> 
     shares, subscribers). One Analytics call per video; default daily quota
     is 200 → linear scale to ~200 videos/day before quota matters.
     """
-    yt_data = build("youtube", "v3", credentials=creds, cache_discovery=False)
-    yt_an = build("youtubeAnalytics", "v2", credentials=creds, cache_discovery=False)
+    # M2: build with a timeout'd authorized transport (http=) rather than
+    # credentials= so a stalled socket can't hang the run. cache_discovery=False
+    # is kept (no discovery-doc fetch). AuthorizedHttp carries the creds, so we
+    # must NOT also pass credentials= (mutually exclusive).
+    yt_data = build("youtube", "v3", http=_timeout_http(creds), cache_discovery=False)
+    yt_an = build("youtubeAnalytics", "v2", http=_timeout_http(creds), cache_discovery=False)
 
     pairs = _list_uploaded_videos(yt_data, channel_id, since)
     if not pairs:
@@ -291,15 +347,21 @@ def pull_youtube_analytics(creds: Credentials, channel_id: str, since: date) -> 
     video_ids = [vid for vid, _ in pairs]
     pub_by_id = dict(pairs)
 
-    stats_resp = yt_data.videos().list(
-        id=",".join(video_ids),
-        part="snippet,statistics,contentDetails",
-    ).execute()
+    # videos.list caps the id filter at 50 per call — chunk to stay under it.
+    # M2: num_retries on each chunk so a transient blip doesn't silently drop a page.
+    items: list[dict] = []
+    for i in range(0, len(video_ids), 50):
+        resp = yt_data.videos().list(
+            id=",".join(video_ids[i:i + 50]),
+            part="snippet,statistics,contentDetails",
+        ).execute(num_retries=YT_API_NUM_RETRIES)
+        items.extend(resp.get("items", []))
 
     end_date = datetime.now(timezone.utc).date().isoformat()
     rows: list[VideoMetrics] = []
+    analytics_error_count = 0  # M5: how many per-video queries failed this run
 
-    for video in stats_resp.get("items", []):
+    for video in items:
         vid = video["id"]
         snippet = video["snippet"]
         stats = video.get("statistics", {})
@@ -307,6 +369,7 @@ def pull_youtube_analytics(creds: Credentials, channel_id: str, since: date) -> 
             snippet["publishedAt"].replace("Z", "+00:00")
         ).date()
 
+        analytics_error = False
         try:
             an_resp = yt_an.reports().query(
                 ids="channel==MINE",
@@ -317,10 +380,15 @@ def pull_youtube_analytics(creds: Credentials, channel_id: str, since: date) -> 
                     "averageViewDuration,averageViewPercentage,subscribersGained"
                 ),
                 filters=f"video=={vid}",
-            ).execute()
+            ).execute(num_retries=YT_API_NUM_RETRIES)
         except Exception as e:
+            # M5: keep the swallow (one bad video must not kill the whole pull),
+            # but TAG the row so downstream can tell API-error-zero from real-zero,
+            # and count it for the run-level summary below.
             log.warning("analytics query failed for video %s: %s", vid, e)
             an_resp = {}
+            analytics_error = True
+            analytics_error_count += 1
 
         an_rows = an_resp.get("rows") or [[]]
         an_headers = [c.get("name") for c in an_resp.get("columnHeaders", [])]
@@ -352,7 +420,19 @@ def pull_youtube_analytics(creds: Credentials, channel_id: str, since: date) -> 
             follower_delta=int(an_data.get("subscribersGained") or 0),
             hold_at_3s=hold_at_3s,
             traffic_source_shorts_pct=traffic_source_shorts_pct,
+            analytics_error=analytics_error,
         ))
+
+    # M5: a per-video warning alone is easy to miss in a long log; emit a loud
+    # run-level summary so a partially- or fully-degraded pull is unmissable and
+    # the run's exit signal reflects that the data is incomplete.
+    if analytics_error_count:
+        log.error(
+            "analytics unavailable for %d/%d videos this run — affected rows are "
+            "flagged analytics_error=True (zero metrics there mean 'unknown', not "
+            "a genuine zero)",
+            analytics_error_count, len(rows),
+        )
 
     rows.sort(key=lambda r: r.published_at, reverse=True)
     return rows
@@ -390,6 +470,8 @@ def merge_into_tracker(rows: list[VideoMetrics], output_path: Path) -> Path:
         "likes", "shares", "comments", "follower_delta",
         # Appended 2026-05-08 — additive, never reorder.
         "hold_at_3s", "traffic_source_shorts_pct",
+        # Appended 2026-05-31 (M5) — additive, never reorder.
+        "analytics_error",
     ]
 
     with output_path.open("a", encoding="utf-8", newline="") as f:
@@ -410,6 +492,9 @@ def merge_into_tracker(rows: list[VideoMetrics], output_path: Path) -> Path:
                 f"{r.traffic_source_shorts_pct:.4f}"
                 if r.traffic_source_shorts_pct is not None else ""
             )
+            # M5: serialize the error flag as a stable "True"/"False" string so
+            # the CSV stays human-readable and consumers can filter on it.
+            d["analytics_error"] = "True" if r.analytics_error else "False"
             w.writerow(d)
     return output_path
 
@@ -434,6 +519,56 @@ def read_existing_rows(output_path: Path) -> list[dict]:
         return out
 
 
+def _log_enumeration_diff(
+    existing_rows: list[dict], new_rows: list[VideoMetrics], since: date
+) -> None:
+    """Set-diff this pull's enumerated ids against the most recent prior
+    pull_date so dropouts surface loudly in the run log.
+
+    The uploads-playlist walk is not snapshot-consistent: the 2026-06-09 pull
+    duplicated xf9HknOP4xs and silently dropped SVx9vjIp278. The dedupe in
+    `_list_uploaded_videos` handles repeats; this diff makes skips visible.
+
+    Only previous-pull ids whose published_at falls inside the current
+    lookback window count as dropouts — a video aging out of a --days window
+    is expected, not a dropout. Rows with an unparseable published_at are
+    treated as in-window (the loud choice).
+    """
+    prev = [
+        r for r in existing_rows
+        if r.get("platform") == "youtube" and r.get("pull_date")
+    ]
+    if not prev:
+        return
+    last_pull = max(r["pull_date"] for r in prev)
+    prev_in_window: set[str] = set()
+    for r in prev:
+        if r["pull_date"] != last_pull or not r.get("video_id"):
+            continue
+        try:
+            pub = date.fromisoformat(r.get("published_at") or "")
+        except ValueError:
+            prev_in_window.add(r["video_id"])
+            continue
+        if pub >= since:
+            prev_in_window.add(r["video_id"])
+
+    new_ids = {m.video_id for m in new_rows}
+    missing = sorted(prev_in_window - new_ids)
+    added = sorted(new_ids - prev_in_window)
+    if missing:
+        log.warning(
+            "enumeration dropout vs previous pull %s: %d id(s) present then, "
+            "missing now: %s",
+            last_pull, len(missing), ", ".join(missing),
+        )
+    if added:
+        log.info(
+            "newly enumerated since previous pull %s: %s",
+            last_pull, ", ".join(added),
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pull weekly analytics for ShadowVerse")
     parser.add_argument("--once", action="store_true", help="Run a single pull and exit")
@@ -444,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = load_config(Path(args.config) if args.config else None)
+    validate_config(config)  # M4: fail fast on missing keys before any stage runs
     run_id = "analytics_" + datetime.now().strftime("%Y%m%dT%H%M%S")
     setup_logging(config, run_id)
 
@@ -465,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = pull_youtube_analytics(creds, yt_channel, since)
 
     output = Path(config["analytics_pull"]["output_path"])
+    _log_enumeration_diff(read_existing_rows(output), rows, since)
     merge_into_tracker(rows, output)
     log.info("wrote %d rows to %s", len(rows), output)
 

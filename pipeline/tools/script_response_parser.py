@@ -70,8 +70,16 @@ _HOOK_LINE_RE = re.compile(
 
 # Optional `(uses HOOK_X ...)` annotation on the SCRIPT_BODY header.
 # When present, captures the chosen-hook letter.
+#
+# The regex deliberately does NOT anchor on `$` and uses `[ \t]*` (not `\s*`)
+# for trailing whitespace — `\s` would consume `\n` and we must leave the
+# newline intact so body extraction can decide whether the body starts on
+# the next line or mid-line after the colon. This handles the cycle-9/10/11/12
+# regression where the LLM emitted prose on the same line as the header
+# (e.g. `SCRIPT_BODY (uses HOOK_A): <prose>`), which the prior `$`-anchored
+# regex could not match. See ENG-002 (2026-05-20 engineering sweep).
 _SCRIPT_BODY_HEADER_RE = re.compile(
-    r"^SCRIPT_BODY(?:\s*\(uses\s+HOOK_([ABC])[^)]*\))?\s*:?\s*$",
+    r"^SCRIPT_BODY(?:[ \t]*\(uses\s+HOOK_([ABC])[^)]*\))?[ \t]*:?[ \t]*",
     re.MULTILINE,
 )
 
@@ -209,6 +217,10 @@ def _clean_body(raw_body: str) -> str:
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     # Trim trailing whitespace per line.
     cleaned = "\n".join(line.rstrip() for line in cleaned.split("\n"))
+    # Drop a trailing markdown horizontal rule (`---`) some LLMs append after the
+    # body — it must never reach TTS / script_FINAL (legacy _parse_script_response
+    # parity; folded into the shared cleaner during the 2026-06-19 unification).
+    cleaned = re.sub(r"\n+-{3,}\s*$", "", cleaned)
     return cleaned.strip()
 
 
@@ -320,8 +332,13 @@ def parse_response(text: str) -> ParsedResponse:
 
     if fc_match:
         # Slice between FACT_CHECK_QUEUE header and either QUALITY_SCORES
-        # header or EOF.
-        if quality_match and quality_match.start() > fc_match.end():
+        # header or EOF. Use >= (not >): when FACT_CHECK_QUEUE is empty and the
+        # FC header regex's trailing `\s` consumed the blank line up to the
+        # QUALITY_SCORES header, quality_match.start() == fc_match.end(); a strict
+        # `>` would fall to the else branch and slice to EOF, leaking the
+        # QUALITY_SCORES bullets into fact_check_queue (differential audit
+        # 2026-06-19). >= yields the correct empty slice.
+        if quality_match and quality_match.start() >= fc_match.end():
             fc_section = text[fc_match.end():quality_match.start()]
         else:
             fc_section = text[fc_match.end():]

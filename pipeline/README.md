@@ -14,8 +14,8 @@ you haven't read it.
 ```
 _pipeline\
 ├── pipeline.py             ← stage functions + orchestrator (entry: `python -m pipeline ...`)
-├── trend_pull.py           ← Monday cron: YouTube + Reddit + Google Trends → topic inbox
-├── analytics_pull.py       ← Sunday cron: per-platform metrics → weekly CSV
+├── trend_pull.py           ← on-demand: YouTube + Reddit + Google Trends → topic inbox (also runs inside daily_batch.py; NOT a registered cron)
+├── analytics_pull.py       ← on-demand: per-platform metrics → weekly CSV (run manually / via the weekly review; NOT a registered cron)
 ├── prompts\                ← 10 prompts extracted from 03_Prompt_Library.md
 │   ├── README.md           ← how the pipeline loads and substitutes them
 │   └── 01_*.md ... 10_*.md
@@ -171,23 +171,28 @@ and a per-channel "About" note before publishing.
 
 ## Running the modules
 
-### Trend pull (Monday morning)
+### Trend pull (on demand)
 
 ```powershell
 python trend_pull.py --once
 ```
 
 Reads `config.trend_pull.*`, hits the three data sources, writes the ranked topic inbox to
-`config.trend_pull.topic_inbox_path`. Schedule via Windows Task Scheduler for 8:00 Mon.
+`config.trend_pull.topic_inbox_path`. Run on demand; it also runs inside `daily_batch.py`.
+**Not currently a registered Windows Scheduled Task** — the "Monday cron" was aspirational.
+(As of 2026-06-11 the ONLY registered task is `ShadowVerse Integrity Sweep`, daily 03:30.)
 
-### Analytics pull (Sunday evening)
+### Analytics pull (on demand)
 
 ```powershell
 python analytics_pull.py --once --days 7
 ```
 
 Reads `config.analytics_pull.*`, pulls last-7-day metrics, appends to the weekly CSV at
-`config.analytics_pull.output_path`. Schedule for 19:00 Sun.
+`config.analytics_pull.output_path`. Run manually or via the weekly review.
+**Not currently a registered Windows Scheduled Task** — the "Sunday cron" was aspirational.
+(Note: OAuth Testing-mode revokes refresh tokens ~weekly, so unattended analytics pulls
+hard-fail until `youtube_oauth_init.py --force` or the app is flipped to Production.)
 
 ### Pipeline (per topic)
 

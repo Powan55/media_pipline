@@ -256,19 +256,107 @@ def extract_chosen_hook(topic_id: str, channel_root: Path) -> ChosenHook:
 
 
 # ---------------------------------------------------------------------------
+# Formula-tag validation (PU-5a, 2026-06-09 weekly review — R2 H3 / CL-7.1)
+# ---------------------------------------------------------------------------
+
+# "Cited-Observation Lead" requires a named THIRD-PARTY HUMAN source (handle,
+# byline, named person/outlet) per the channel's cited-observation durable
+# rule. The 2026-06-09 review found >=5 vendor-only hooks tagged CO-Lead
+# (2026-06-05_001/_002, 2026-06-07_002, 2026-06-09_001/_002), contaminating
+# formula attribution. This validation NEVER blocks the append — it adds a
+# `tag_warning` field to the JSONL row + logs a WARNING so the next review
+# can bucket the row correctly.
+
+_CITED_OBSERVATION_FORMULA = "cited-observation lead"
+TAG_WARNING_VENDOR_ONLY = "vendor-only hook tagged as Cited-Observation Lead"
+
+# @handle (X/Twitter etc.) or reddit u/name / r/sub.
+_NAMED_HANDLE_RE = re.compile(r"(?:^|[\s(\[\"'])@\w{2,}|\b[ur]/[\w-]{2,}", re.IGNORECASE)
+
+# Named outlets — bylines/publications count as named third-party sources.
+_NAMED_OUTLET_RE = re.compile(
+    r"\b(?:bloomberg|reuters|the\s+verge|techcrunch|wired|forbes|cnbc|cnn|bbc"
+    r"|axios|semafor|politico|fortune|the\s+atlantic|new\s+york\s+times|nyt"
+    r"|wall\s+street\s+journal|wsj|washington\s+post|business\s+insider"
+    r"|ars\s+technica|the\s+information|404\s+media|9to5mac|hacker\s+news"
+    r"|mit\s+technology\s+review)\b",
+    re.IGNORECASE,
+)
+
+# Vendor / product tokens (lowercase). A capitalized bigram whose words BOTH
+# avoid this set is treated as a person/outlet name ("Jamie Dimon", "Terence
+# Tao"); a bigram touching the set is a vendor/product pair ("Google DeepMind",
+# "Apple Intelligence", "Claude Code") and does NOT count as a named human.
+_VENDOR_PRODUCT_TOKENS = frozenset({
+    "openai", "anthropic", "google", "deepmind", "microsoft", "meta", "apple",
+    "amazon", "tesla", "nvidia", "xai", "chatgpt", "claude", "gemini", "grok",
+    "copilot", "llama", "gpt", "sora", "bing", "windows", "siri", "alexa",
+    "iphone", "android", "intelligence", "code", "pro", "plus", "max", "ultra",
+    "mini", "flash", "store", "studio", "cloud", "watch", "vision", "ai",
+})
+
+_CAP_BIGRAM_RE = re.compile(r"\b([A-Z][\w’']+)\s+([A-Z][\w’']+)\b")
+
+
+def _has_named_source(text: str) -> bool:
+    """Heuristic: does the hook text name a third-party source?
+
+    True on any of: an @handle / u/name / r/sub, a known outlet name, or a
+    capitalized bigram where neither word is a vendor/product token (a
+    person-name like "Sam Altman" / "Jamie Dimon").
+
+    Known limitation (documented, not blocking): single-surname citations
+    ("Karpathy says...") and status-noun anonymous sources ("a Fields
+    medalist") are not detected and will draw a (non-blocking) tag_warning.
+    """
+    if _NAMED_HANDLE_RE.search(text):
+        return True
+    if _NAMED_OUTLET_RE.search(text):
+        return True
+    for a, b in _CAP_BIGRAM_RE.findall(text):
+        if a.lower() in _VENDOR_PRODUCT_TOKENS or b.lower() in _VENDOR_PRODUCT_TOKENS:
+            continue
+        return True
+    return False
+
+
+def cited_observation_tag_warning(formula: str, hook_text: str) -> str | None:
+    """Return the PU-5a tag-warning string, or None when the tag looks valid.
+
+    Fires only when ``formula`` is "Cited-Observation Lead" (case-insensitive)
+    AND ``hook_text`` contains no named-source pattern. Pure + non-blocking:
+    callers attach the result to the JSONL row; they never reject the row.
+    """
+    if (formula or "").strip().lower() != _CITED_OBSERVATION_FORMULA:
+        return None
+    if _has_named_source(hook_text or ""):
+        return None
+    return TAG_WARNING_VENDOR_ONLY
+
+
+# ---------------------------------------------------------------------------
 # Public writer
 # ---------------------------------------------------------------------------
 
 
 def _chosen_to_record(chosen: ChosenHook) -> dict:
     """Convert a ChosenHook into the JSONL row schema (sans ``logged_at``)."""
-    return {
+    record = {
         "topic_id": chosen.topic_id,
         "hook_letter": chosen.hook_letter,
         "hook_text": chosen.hook_text,
         "formula": chosen.formula,
         "all_three_hooks": [asdict(c) for c in chosen.all_three_hooks],
     }
+    # PU-5a: non-blocking formula-tag validation — annotate, never reject.
+    warning = cited_observation_tag_warning(chosen.formula, chosen.hook_text)
+    if warning is not None:
+        record["tag_warning"] = warning
+        log.warning(
+            "hook-log tag validation for %s: %s (hook=%r)",
+            chosen.topic_id, warning, chosen.hook_text,
+        )
+    return record
 
 
 def _records_equal(a: dict, b: dict) -> bool:

@@ -59,8 +59,13 @@ def _make_args(
 
 
 def _fake_config() -> dict:
-    """Minimal config dict with the channel_root key the hook reads."""
-    return {"paths": {"channel_root": r"C:\does\not\matter"}}
+    """Minimal config dict with the channel_root + project_root keys the hook reads."""
+    return {
+        "paths": {
+            "channel_root": r"C:\does\not\matter",
+            "project_root": r"C:\does\not\matter\project",
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +240,8 @@ class TestHookArgumentForwarding(unittest.TestCase):
 
     def test_archive_called_with_keyword_channel_root(self) -> None:
         args = _make_args(topic_id="2026-05-08_001", privacy="public", dry_run=False)
-        config = {"paths": {"channel_root": r"C:\fake\channel"}}
+        config = {"paths": {"channel_root": r"C:\fake\channel",
+                            "project_root": r"C:\fake\project"}}
         with mock.patch.object(
             youtube_upload, "archive_topic", return_value={},
         ) as m_archive, mock.patch.object(
@@ -249,7 +255,8 @@ class TestHookArgumentForwarding(unittest.TestCase):
 
     def test_postmortem_called_with_keyword_channel_and_project_root(self) -> None:
         args = _make_args(topic_id="2026-05-08_002", privacy="public", dry_run=False)
-        config = {"paths": {"channel_root": r"C:\fake\channel"}}
+        config = {"paths": {"channel_root": r"C:\fake\channel",
+                            "project_root": r"C:\fake\project"}}
         with mock.patch.object(
             youtube_upload, "archive_topic", return_value={},
         ), mock.patch.object(
@@ -261,6 +268,49 @@ class TestHookArgumentForwarding(unittest.TestCase):
         self.assertEqual(call.kwargs["channel_root"], Path(r"C:\fake\channel"))
         # project_root is required by generate_postmortem; verify it's passed as a Path.
         self.assertIsInstance(call.kwargs["project_root"], Path)
+
+
+# ---------------------------------------------------------------------------
+# H1 — project_root must come from config, never a hardcoded path
+# ---------------------------------------------------------------------------
+
+
+class TestProjectRootFromConfig(unittest.TestCase):
+    """H1 — generate_postmortem's project_root is derived from
+    config["paths"]["project_root"], and a config missing that key fails loud
+    (clear KeyError) instead of silently using an off-box operator path."""
+
+    def test_postmortem_project_root_derived_from_config(self) -> None:
+        """The Path handed to generate_postmortem matches config's project_root."""
+        args = _make_args(topic_id="2026-05-08_010", privacy="public", dry_run=False)
+        config = {"paths": {"channel_root": r"C:\fake\channel",
+                            "project_root": r"D:\elsewhere\ProjectRoot"}}
+        with mock.patch.object(
+            youtube_upload, "archive_topic", return_value={},
+        ), mock.patch.object(
+            youtube_upload, "generate_postmortem", return_value=Path("pm.md"),
+        ) as m_pm:
+            youtube_upload._run_post_upload_hooks(args, config, publish_at_utc=None)
+        # The hardcoded r"C:\Users\laxmi\Documents\Project" must NOT leak through;
+        # the project_root must come straight from the config value.
+        self.assertEqual(
+            m_pm.call_args.kwargs["project_root"],
+            Path(r"D:\elsewhere\ProjectRoot"),
+        )
+
+    def test_missing_project_root_key_raises_keyerror(self) -> None:
+        """A config WITHOUT paths.project_root raises a clear KeyError at use,
+        not a silent wrong-path. Hooks run (public) so the lookup is reached."""
+        args = _make_args(topic_id="2026-05-08_011", privacy="public", dry_run=False)
+        config = {"paths": {"channel_root": r"C:\fake\channel"}}  # no project_root
+        with mock.patch.object(
+            youtube_upload, "archive_topic", return_value={},
+        ), mock.patch.object(
+            youtube_upload, "generate_postmortem", return_value=Path("pm.md"),
+        ):
+            with self.assertRaises(KeyError) as ctx:
+                youtube_upload._run_post_upload_hooks(args, config, publish_at_utc=None)
+        self.assertIn("project_root", str(ctx.exception))
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +436,8 @@ class TestHookSelectionLogAutoAppend(unittest.TestCase):
     def test_hook_log_uses_correct_path_under_channel_root(self) -> None:
         """Auto-append targets <channel_root>/01_research/hook_selection_log.jsonl."""
         args = _make_args(privacy="public", dry_run=False)
-        config = {"paths": {"channel_root": r"C:\fake\channel"}}
+        config = {"paths": {"channel_root": r"C:\fake\channel",
+                            "project_root": r"C:\fake\project"}}
         m_archive, m_pm = self._patch_existing_hooks()
         fake_chosen = mock.MagicMock(hook_letter="A", formula="Contradiction")
         with m_archive, m_pm, mock.patch.object(

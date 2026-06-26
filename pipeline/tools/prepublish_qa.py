@@ -40,6 +40,24 @@ three-layer defense against the `_12_002` template-leak class of bug):
         the existing check and bleed into other call-sites, we take the next
         free integer (#14) and document the deviation here.
 
+Two later script-side checks share the same pre-render gate (`check_script` /
+`_scan_script_for_artifacts_or_halt`, BEFORE TTS), each taking the next free id:
+
+    15. script_FINAL.txt sourcing hygiene (PU-7b, 2026-05-29; broadened by PU-4,
+        2026-06-19): no residual `[VERIFY: ...]` tag and no anonymous citation.
+        Anonymous shapes covered: "a Reddit/X user", "a/some Redditor(s)",
+        "a user on r/… / Reddit / Twitter / HN / a forum", "a developer" (bare
+        or "+ verb"), bare "Researchers / scientists <verb>", and "someone
+        <verb>". A named handle (`u/`/`@`) or a name-adjacent role word
+        ("Anthropic researcher Tom Brown") on the line suppresses the finding.
+        Run via `check_script_sourcing(script_path)`.
+    16. script_FINAL.txt pre-render lint: no unresolved placeholder token
+        (`[VERIFY` / `[NEEDS` / `[TODO` / `[FIXME`) and no retired/forbidden CTA.
+        The banned-CTA list is pulled from the style guide's retired/forbidden
+        sections so it stays in sync. Run via `check_script_prerender(script_path)`.
+        Forward-looking guard for the `_08_001` ([VERIFY] spoken aloud) and
+        `_11_002` (retired comment-bait) published defects.
+
 Note on numbering: Agent I §6.3 listed 12 checks where #11 was silent-intro and
 #12 was no-black-frame-opener. The spec asked us to drop standalone #12 and fuse
 its black-frame test into the silent-intro check, so externally we expose
@@ -111,6 +129,11 @@ from tools.script_artifact_patterns import (  # noqa: E402
     ArtifactMatch,
     format_matches,
     scan_for_artifacts,
+)
+from tools.script_prerender_patterns import (  # noqa: E402
+    build_cta_matchers,
+    format_lint_matches,
+    scan_script_for_lint,
 )
 
 log = logging.getLogger("prepublish_qa")
@@ -1136,6 +1159,114 @@ def check_topic(
 SCRIPT_ARTIFACT_CHECK_ID: int = 14
 SCRIPT_ARTIFACT_CHECK_NAME: str = "script_template_artifacts"
 
+# Check #15 (weekly-review 2026-05-29, PU-7b): script-side sourcing-hygiene
+# halt. A FINAL script must never ship with (a) a residual `[VERIFY: ...]`
+# placeholder tag (gate-2 should have resolved or stripped it — `_08_001`
+# shipped with an open one, R2 §7), or (b) an ANONYMOUS "a Reddit/X user…"
+# citation that violates the cited-observation durable rule (named-source-only;
+# R2 §4). Runs at the same pre-render gate as #14 (`check_script`), BEFORE TTS.
+SCRIPT_SOURCING_CHECK_ID: int = 15
+SCRIPT_SOURCING_CHECK_NAME: str = "script_sourcing_hygiene"
+
+# Check #16 (forward-looking pre-render lint): halt render on an unresolved
+# placeholder token (`[VERIFY` / `[NEEDS` / `[TODO` / `[FIXME`) or a retired /
+# forbidden CTA phrase in a FINAL script. Motivated by two real published
+# defects: `_08_001` (a `[VERIFY: ...]` note spoken aloud, vid Eaxrx6CVJ0s) and
+# `_11_002` (the retired `Comment "deploy" and I will send you the link.`
+# comment-bait). Runs at the same pre-render gate as #14/#15, BEFORE TTS. The
+# banned-CTA list is pulled from the style guide's retired/forbidden sections
+# (see tools.script_prerender_patterns) so it stays in sync; a built-in baseline
+# is always enforced even if the style guide can't be read.
+SCRIPT_PRERENDER_CHECK_ID: int = 16
+SCRIPT_PRERENDER_CHECK_NAME: str = "script_prerender_lint"
+
+# Residual placeholder tag: matches `[VERIFY]` and `[VERIFY: ...]`, case-
+# insensitive — mirrors tools.script_response_parser._VERIFY_TAG_RE semantics.
+_RESIDUAL_VERIFY_RE = re.compile(r"\[VERIFY\b[^\]]*\]", re.IGNORECASE)
+
+# A named Reddit/X handle anywhere in the SAME line suppresses the anonymous-
+# citation finding for that line — "u/lreeves on r/ClaudeAI" is a NAMED source
+# and must pass. (`u/<handle>` or a bare `@handle`.)
+_NAMED_HANDLE_RE = re.compile(
+    r"(?:\bu/[A-Za-z0-9_\-]{3,}\b)|(?<![A-Za-z0-9_])@[A-Za-z0-9_]{2,}\b"
+)
+
+# Reporting verbs that mark a citation framing (used by several anon patterns).
+_REPORTING_VERB = (
+    r"(?:say|says|said|report|reports|reported|claim|claims|claimed|note|notes|"
+    r"noted|find|finds|found|write|writes|wrote|post|posts|posted|share|shares|"
+    r"shared|observe|observes|observed|mention|mentions|mentioned|build|builds|"
+    r"built|discover|discovers|discovered|show|shows|showed|tried|test|tests|tested)"
+)
+
+# PU-4 (2026-06-19 review): a name-adjacency guard so a legitimately NAMED source
+# that happens to use a role word is NOT flagged. Matches a role word
+# (researcher(s)/scientist(s)/developer/engineer) when it is immediately preceded
+# OR followed by a proper name or "named <Name>" — e.g. "Anthropic researcher Tom
+# Brown", "researcher Tom Brown", "a developer named Jane". When this matches on a
+# line, that line is treated as named (the anon finding is suppressed), mirroring
+# how a `u/`/`@` handle suppresses it. Kept conservative: requires a Capitalized
+# token (or the explicit word "named") adjacent to the role word.
+_NAMED_ROLE_RE = re.compile(
+    r"(?:"
+    # <Proper Noun> <role>  →  "Anthropic researcher", "OpenAI engineer"
+    r"\b[A-Z][A-Za-z0-9.\-]+\s+(?:researchers?|scientists?|developer|engineer)\b"
+    r"|"
+    # <role> named <Name>  →  "a developer named Jane"
+    r"\b(?:researchers?|scientists?|developer|engineer)\s+named\s+[A-Z][A-Za-z\-]+"
+    r"|"
+    # <role> <First Last>  →  "researcher Tom Brown" (two capitalized tokens)
+    r"\b(?:researchers?|scientists?|developer|engineer)\s+[A-Z][A-Za-z\-]+\s+[A-Z][A-Za-z\-]+"
+    r")"
+)
+
+# Anonymous-citation templates. Deliberately CONSERVATIVE (this is a render-
+# halting gate on a live auto-pipeline — a false positive blocks a ship), so we
+# only match the specific "anonymous source" shapes the cited-observation rule
+# bans, and only when no named handle/role-name co-occurs on the line (checked
+# separately):
+#   - "a/an/one Reddit|X|Twitter user" (+ optional said/reported/...)
+#   - "a/an/one user on r/<sub>" or "a/some Redditor(s)"
+#   - "a/an/one user on Reddit|Twitter|X|HN|Hacker News|Discord|a/the forum"
+#     (PU-4: broadened past the r/<sub>-only shape)
+#   - "a/an/one developer|user|redditor (says|said|reported|reports|claims|
+#      noted|found|wrote|posted|shared|observed)"
+#   - "a/an/one developer" standalone (PU-4: bare role word as sole attribution)
+#   - "Researchers|Scientists <reporting-verb>" with no named lab/person (PU-4)
+#   - "someone <reporting-verb>" as sole attribution (PU-4)
+_ANON_CITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:a|an|one)\s+(?:reddit|x|twitter)\s+user\b", re.IGNORECASE),
+    re.compile(r"\b(?:a|an|one|some)\s+redditors?\b", re.IGNORECASE),
+    re.compile(r"\b(?:a|an|one)\s+user\s+on\s+r/", re.IGNORECASE),
+    # PU-4: "a user on <surface>" beyond the r/<sub> shape.
+    re.compile(
+        r"\b(?:a|an|one)\s+user\s+on\s+"
+        r"(?:reddit|twitter|x|hn|hacker\s+news|discord|"
+        r"(?:a|an|the|some)\s+(?:forum|thread|server|subreddit))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:a|an|one)\s+(?:developer|user|redditor|commenter|poster)\s+"
+        r"(?:says|said|reported|reports|claims|claimed|noted|notes|found|"
+        r"wrote|posted|shared|observed|mentioned)\b",
+        re.IGNORECASE,
+    ),
+    # PU-4: bare "a developer" as a sole attribution noun phrase. The
+    # name-adjacency guard (_NAMED_ROLE_RE) suppresses "a developer named Jane".
+    re.compile(r"\b(?:a|an|one)\s+developer\b", re.IGNORECASE),
+    # PU-4: leading / standalone "Researchers" or "scientists" + a reporting
+    # verb, with no named lab/person (suppressed by _NAMED_ROLE_RE when present).
+    re.compile(
+        rf"\b(?:researchers|scientists)\s+{_REPORTING_VERB}\b",
+        re.IGNORECASE,
+    ),
+    # PU-4: "someone" as the sole attribution + a reporting/action verb.
+    re.compile(
+        rf"\bsomeone\s+{_REPORTING_VERB}\b",
+        re.IGNORECASE,
+    ),
+)
+
 # Heuristic upper bound on a sane script body. `_12_002`-class scripts are
 # ~120 words / <1 KB. Anything past this is almost certainly a misrouted
 # binary or full prompt-response dump, and we should fail rather than scan
@@ -1307,6 +1438,289 @@ def check_script(script_path: Path) -> CheckResult:
     )
     return _fail(
         SCRIPT_ARTIFACT_CHECK_ID, SCRIPT_ARTIFACT_CHECK_NAME,
+        expected, actual, message,
+    )
+
+
+def _scan_script_for_sourcing_issues(text: str) -> list[tuple[int, str, str]]:
+    """Return ``(line_no, kind, line_text)`` for each sourcing-hygiene hit.
+
+    ``kind`` is ``"residual_verify"`` or ``"anonymous_citation"``. line_no is
+    1-based. An empty list means the script is clean.
+
+    Anonymous-citation matches are SUPPRESSED on any line that also carries a
+    named Reddit/X handle (``u/x`` / ``@y``) OR a name-adjacent role word
+    (``Anthropic researcher Tom Brown`` / ``a developer named Jane``, via
+    :data:`_NAMED_ROLE_RE`) — that line is a NAMED citation, which the
+    cited-observation rule explicitly allows.
+    """
+    hits: list[tuple[int, str, str]] = []
+    lines = text.splitlines()
+    # Residual VERIFY tags — scan full text so a tag split oddly still trips.
+    for m in _RESIDUAL_VERIFY_RE.finditer(text):
+        line_no = text.count("\n", 0, m.start()) + 1
+        line_text = lines[line_no - 1] if 0 <= line_no - 1 < len(lines) else m.group(0)
+        hits.append((line_no, "residual_verify", line_text))
+    # Anonymous citations — line by line so we can check for a co-located handle
+    # or a name-adjacent role word (both mark a NAMED source → allowed).
+    for i, line in enumerate(lines, start=1):
+        if _NAMED_HANDLE_RE.search(line) or _NAMED_ROLE_RE.search(line):
+            continue  # named source on this line → allowed
+        if any(p.search(line) for p in _ANON_CITATION_PATTERNS):
+            hits.append((i, "anonymous_citation", line))
+    hits.sort(key=lambda h: (h[0], h[1]))
+    return hits
+
+
+def check_script_sourcing(script_path: Path) -> CheckResult:
+    """Check #15 (PU-7b): halt render on residual ``[VERIFY: …]`` tags or
+    anonymous "a Reddit/X user" citations in a FINAL script.
+
+    Runs at the same pre-render gate as :func:`check_script` (#14), BEFORE TTS.
+    Two failure classes, both motivated by `_08_001` (R2 §4 + §7 —
+    a FINAL reached render carrying an open ``[VERIFY:`` tag AND an anonymous
+    r/ClaudeAI citation):
+
+      * **residual_verify** — any ``[VERIFY]`` / ``[VERIFY: …]`` placeholder
+        survived gate-2 resolution into the signed-off body.
+      * **anonymous_citation** — an anonymous-source framing with no named
+        handle, violating the cited-observation durable rule. Covers
+        "a Reddit/X user", "a/some Redditor(s)", "a user on r/… / Reddit /
+        Twitter / HN / a forum", "a developer" (bare or "+ verb"), a bare
+        "Researchers / scientists <reporting verb>", and "someone <verb>"
+        (the last four broadened under PU-4, 2026-06-19 review).
+
+    Conservative by design (this gate halts a live auto-pipeline ship): the
+    anonymous-citation patterns match only the specific banned shapes, and are
+    suppressed on any line that also carries a named ``u/`` / ``@`` handle OR a
+    name-adjacent role word (``Anthropic researcher Tom Brown`` / ``a developer
+    named Jane``) — so a legitimately named source never trips the gate.
+
+    Mirrors :func:`check_script`'s file guards (missing / non-file / wrong
+    suffix / empty / oversized / binary all FAIL). Never raises; always
+    returns a ``CheckResult`` with ``check_id=15``.
+    """
+    expected = "no residual [VERIFY:] tags and no anonymous 'a Reddit/X user' citations"
+
+    if script_path is None:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, "no path provided",
+            "check_script_sourcing() called with script_path=None",
+        )
+    script_path = Path(script_path)
+    if not script_path.exists():
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, f"missing at {script_path}",
+            f"script_FINAL.txt not found: {script_path}",
+        )
+    if not script_path.is_file():
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, f"not a regular file: {script_path}",
+            f"expected a .txt file but {script_path} is not a regular file",
+        )
+    suffix = script_path.suffix.lower()
+    if suffix in _SCRIPT_REJECT_SUFFIXES:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, f"wrong file type: {suffix}",
+            f"check_script_sourcing expects a .txt script; got {script_path.name}",
+        )
+    try:
+        size = script_path.stat().st_size
+    except OSError as e:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, "stat() failed", f"could not stat {script_path}: {e}",
+        )
+    if size == 0:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, "empty file", f"script_FINAL.txt is empty: {script_path}",
+        )
+    if size > _SCRIPT_MAX_SCAN_BYTES:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, f"{size} bytes (cap {_SCRIPT_MAX_SCAN_BYTES})",
+            f"script_FINAL.txt is suspiciously large ({size} bytes); refusing to scan.",
+        )
+    try:
+        raw_bytes = script_path.read_bytes()
+    except OSError as e:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, "unreadable", f"could not read {script_path}: {e}",
+        )
+    if b"\x00" in raw_bytes:
+        return _fail(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, "binary content (null bytes present)",
+            f"{script_path.name} contains null bytes; cannot scan as a text script.",
+        )
+    text = raw_bytes.decode("utf-8", errors="replace")
+
+    hits = _scan_script_for_sourcing_issues(text)
+    if not hits:
+        return _pass(
+            SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+            expected, f"{script_path.name}: clean ({len(text)} chars scanned)",
+        )
+
+    n_verify = sum(1 for _, kind, _ in hits if kind == "residual_verify")
+    n_anon = sum(1 for _, kind, _ in hits if kind == "anonymous_citation")
+    actual = (
+        f"{len(hits)} sourcing issue{'s' if len(hits) != 1 else ''} "
+        f"({n_verify} residual [VERIFY:], {n_anon} anonymous citation)"
+    )
+    detail = "\n".join(
+        f"  line {ln} [{kind}]: {lt.strip()[:90]!r}" for ln, kind, lt in hits
+    )
+    message = (
+        f"sourcing-hygiene issues in {script_path.name} (PU-7b check #15 — "
+        f"residual VERIFY tag and/or anonymous citation):\n{detail}"
+    )
+    return _fail(
+        SCRIPT_SOURCING_CHECK_ID, SCRIPT_SOURCING_CHECK_NAME,
+        expected, actual, message,
+    )
+
+
+def _guard_script_path(
+    script_path: Path | None,
+    check_id: int,
+    check_name: str,
+) -> tuple[str | None, CheckResult | None]:
+    """Shared existence / type / size / binary guards for the script-side checks.
+
+    Returns ``(text, None)`` once the file is read and decoded, or
+    ``(None, CheckResult-FAIL)`` on any guard trip. Mirrors the inline guards in
+    :func:`check_script` and :func:`check_script_sourcing` so #16 rejects the
+    same misrouted-input cases (missing / non-file / wrong-suffix / empty /
+    oversized / binary) rather than silently passing.
+    """
+    expected = "readable .txt script body"
+    if script_path is None:
+        return None, _fail(
+            check_id, check_name, expected, "no path provided",
+            f"{check_name} called with script_path=None",
+        )
+    script_path = Path(script_path)
+    if not script_path.exists():
+        return None, _fail(
+            check_id, check_name, expected, f"missing at {script_path}",
+            f"script_FINAL.txt not found: {script_path}",
+        )
+    if not script_path.is_file():
+        return None, _fail(
+            check_id, check_name, expected, f"not a regular file: {script_path}",
+            f"expected a .txt file but {script_path} is not a regular file",
+        )
+    suffix = script_path.suffix.lower()
+    if suffix in _SCRIPT_REJECT_SUFFIXES:
+        return None, _fail(
+            check_id, check_name, expected, f"wrong file type: {suffix}",
+            f"{check_name} expects a .txt script; got {script_path.name}",
+        )
+    try:
+        size = script_path.stat().st_size
+    except OSError as e:
+        return None, _fail(
+            check_id, check_name, expected, "stat() failed",
+            f"could not stat {script_path}: {e}",
+        )
+    if size == 0:
+        return None, _fail(
+            check_id, check_name, expected, "empty file",
+            f"script_FINAL.txt is empty: {script_path}",
+        )
+    if size > _SCRIPT_MAX_SCAN_BYTES:
+        return None, _fail(
+            check_id, check_name, expected, f"{size} bytes (cap {_SCRIPT_MAX_SCAN_BYTES})",
+            f"script_FINAL.txt is suspiciously large ({size} bytes); refusing to scan.",
+        )
+    try:
+        raw_bytes = script_path.read_bytes()
+    except OSError as e:
+        return None, _fail(
+            check_id, check_name, expected, "unreadable",
+            f"could not read {script_path}: {e}",
+        )
+    if b"\x00" in raw_bytes:
+        return None, _fail(
+            check_id, check_name, expected, "binary content (null bytes present)",
+            f"{script_path.name} contains null bytes; cannot scan as a text script.",
+        )
+    return raw_bytes.decode("utf-8", errors="replace"), None
+
+
+def check_script_prerender(
+    script_path: Path,
+    *,
+    style_guide_path: str | Path | None = None,
+) -> CheckResult:
+    """Check #16: pre-render lint — halt render on an unresolved placeholder or a
+    retired/forbidden CTA in a FINAL script.
+
+    Forward-looking guard for two failure modes that each shipped to YouTube and
+    cost views:
+
+      * **placeholder** — a residual editor / fact-check marker (``[VERIFY``,
+        ``[NEEDS``, ``[TODO``, ``[FIXME``) survived gate-2 into the signed-off
+        body and was spoken aloud by edge-TTS (`_08_001`: a ``[VERIFY: ...]``
+        note rendered mid-VO, vid Eaxrx6CVJ0s).
+      * **banned_cta** — a retired transactional CTA / engagement-beg
+        (`_11_002`: ``Comment "deploy" and I will send you the link.``), which
+        the style guide explicitly retired and whose promised payload is not a
+        live funnel.
+
+    The banned-CTA list is pulled from the style guide's retired/forbidden
+    sections (:func:`tools.script_prerender_patterns.build_cta_matchers`) so it
+    stays in sync with the operator's single source of truth, on top of a
+    built-in baseline that is always enforced even when the style guide can't be
+    read.
+
+    Runs at the same pre-render gate as #14 / #15, BEFORE TTS. Mirrors their
+    file guards; never raises; always returns a ``CheckResult`` with
+    ``check_id=16``.
+
+    Args:
+        script_path: Path to the candidate ``script_FINAL.txt``.
+        style_guide_path: Optional override for the style guide whose
+            retired/forbidden CTA phrases augment the baseline. Defaults to
+            :data:`tools.script_prerender_patterns.DEFAULT_STYLE_GUIDE_PATH`.
+    """
+    expected = (
+        "no unresolved placeholders ([VERIFY|NEEDS|TODO|FIXME]) and no retired CTA"
+    )
+    text, guard_fail = _guard_script_path(
+        script_path, SCRIPT_PRERENDER_CHECK_ID, SCRIPT_PRERENDER_CHECK_NAME
+    )
+    if guard_fail is not None:
+        return guard_fail
+
+    matchers = build_cta_matchers(style_guide_path)
+    matches = scan_script_for_lint(text, matchers)
+    if not matches:
+        return _pass(
+            SCRIPT_PRERENDER_CHECK_ID, SCRIPT_PRERENDER_CHECK_NAME,
+            expected, f"{Path(script_path).name}: clean ({len(text)} chars scanned)",
+        )
+
+    n_placeholder = sum(1 for m in matches if m.kind == "placeholder")
+    n_cta = sum(1 for m in matches if m.kind == "banned_cta")
+    actual = (
+        f"{len(matches)} issue{'s' if len(matches) != 1 else ''} "
+        f"({n_placeholder} placeholder, {n_cta} banned CTA)"
+    )
+    message = (
+        f"pre-render lint failures in {Path(script_path).name} "
+        f"(#16 — unresolved placeholder and/or retired CTA):\n"
+        f"{format_lint_matches(matches)}"
+    )
+    return _fail(
+        SCRIPT_PRERENDER_CHECK_ID, SCRIPT_PRERENDER_CHECK_NAME,
         expected, actual, message,
     )
 
