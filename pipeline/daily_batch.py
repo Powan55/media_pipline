@@ -654,11 +654,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--refresh-trends", action="store_true",
                         help="Force trend_pull re-run even if today's artifact exists")
     parser.add_argument(
-        "--track", default="ai-vendor", choices=["ai-vendor", "general-tech"],
+        "--track", default="ai-vendor", choices=["ai-vendor", "general-tech", "longform"],
         help=(
             "Topic track. 'general-tech' (dual-track slot) draws from the "
             "general-tech idea-gen prompt + weights and isolates IO under "
-            "_daily_<date>_general-tech. Run the two tracks sequentially."
+            "_daily_<date>_general-tech. 'longform' draws from the long-form "
+            "deep-dive idea prompt (reusing the ai-vendor trend pool + default "
+            "scoring) and isolates IO under _daily_<date>_longform. Run tracks "
+            "sequentially."
         ),
     )
     parser.add_argument(

@@ -305,6 +305,20 @@ learning:
                                 # positional loader regardless, so this is cosmetic for other DictReader
                                 # consumers. Touches the canonical analytics file; a .bak is taken.
 
+# --- Long-form deep-dive track (added 2026-06-28) ---------------------------
+# Additive + INERT for the Shorts pipeline: nothing reads `longform` unless the
+# effective config is built via tools/longform_config.build_longform_config()
+# (used only by the /longform -auto command). enabled:false here guarantees the
+# base config is never in long-form mode, so the Shorts path stays byte-identical.
+longform:
+  enabled: false                # base (Shorts) config is NEVER long-form; the helper flips this true
+  imagegen_python: C:\ContentOps\_imagegen\venv\Scripts\python.exe  # isolated SDXL venv (machine-specific)
+  # gen_stills_script defaults to the repo-local tools/gen_stills.py; override only to relocate it.
+  publish_slot_et: "16:00"      # single afternoon slot, off the Shorts 11:25/12:35 peak hours
+  word_count_min: 1400
+  word_count_max: 2000
+  max_duration_s: 900           # 15-min ceiling for the long-form prepublish-QA gate
+
 logging:
   level: INFO                           # DEBUG | INFO | WARNING | ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

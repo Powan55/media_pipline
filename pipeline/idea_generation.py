@@ -76,11 +76,14 @@ def _ensure_trends_artifact(
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out_dir = channel_root / "01_research"
-    name = f"trends_{today}.json" if track == "ai-vendor" else f"trends_{track}_{today}.json"
+    # long-form reuses the ai-vendor trend pool (deep-dives draw from the same
+    # AI-vendor signals), so no separate trends_longform_<date>.json is pulled.
+    trends_track = "ai-vendor" if track == "longform" else track
+    name = f"trends_{today}.json" if trends_track == "ai-vendor" else f"trends_{trends_track}_{today}.json"
     artifact = out_dir / name
     if force_refresh or not artifact.exists():
-        log.info("trend artifact missing or stale; running pull_all (track=%s)", track)
-        artifact_path, _ = pull_all(out_dir, track=track)
+        log.info("trend artifact missing or stale; running pull_all (track=%s)", trends_track)
+        artifact_path, _ = pull_all(out_dir, track=trends_track)
         if artifact_path is None:
             raise RuntimeError("pull_all returned no artifact path (unexpected)")
         return artifact_path
@@ -195,7 +198,7 @@ def generate_ideas(
     # ai-vendor prompt has no {DISCOVERED_STORIES} token, so the replace below is
     # a no-op and the ai-vendor prompt stays byte-identical).
     discovered_block = ""
-    if track != "ai-vendor":
+    if track not in ("ai-vendor", "longform"):
         ds_path = base / "discovered_stories.txt"
         discovered_block = (
             ds_path.read_text(encoding="utf-8").strip()
@@ -204,6 +207,9 @@ def generate_ideas(
 
     if track == "ai-vendor":
         prompt_name = "02_idea_generation"
+    elif track == "longform":
+        lf_prompt = ((config.get("tracks") or {}).get("longform") or {}).get("idea_prompt")
+        prompt_name = lf_prompt or "02_idea_generation_longform"
     else:
         gt_prompt = ((config.get("tracks") or {}).get("general_tech") or {}).get("idea_prompt")
         prompt_name = gt_prompt or "02_idea_generation_general_tech"
@@ -243,7 +249,7 @@ def generate_ideas(
     # AI-vendor bonus so the scorer doesn't bias against the non-AI topics the
     # track exists to surface. Both are config-overridable (Phase 6: tracks.*),
     # with sensible defaults when the config block is absent.
-    if track == "ai-vendor":
+    if track in ("ai-vendor", "longform"):
         ranked = rank_candidates(candidates)
     else:
         gt_cfg = (config.get("tracks") or {}).get("general_tech") or {}

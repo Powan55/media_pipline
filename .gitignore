@@ -21,6 +21,7 @@
 # --- Operator-only state (per durable rules) ---
 SESSION_HANDOFF.md
 TODO.md
+TODO_archive*.md
 .research/
 **/postmortems/
 **/analysis/

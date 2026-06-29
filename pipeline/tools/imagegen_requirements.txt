@@ -1,0 +1,29 @@
+# Isolated image-gen venv requirements (default location: C:\ContentOps\_imagegen\venv).
+#
+# This venv is SEPARATE from the pipeline venv on purpose: the SDXL/diffusers stack
+# pulls a `transformers` + `tokenizers` range that can conflict with the pipeline's
+# pinned deps (see the F5-TTS note in the main requirements.txt). The pipeline shells
+# out to this venv to run tools/gen_stills.py (SDXL-Turbo landscape stills for the
+# long-form track) — the same way it shells out to ffmpeg.
+#
+# One-time setup:
+#   python -m venv C:\ContentOps\_imagegen\venv
+#   C:\ContentOps\_imagegen\venv\Scripts\python -m pip install torch==2.5.1 \
+#       --index-url https://download.pytorch.org/whl/cu121
+#   C:\ContentOps\_imagegen\venv\Scripts\python -m pip install -r tools/imagegen_requirements.txt
+#
+# Norton SSL-scanning note: if HuggingFace downloads fail with
+# CERTIFICATE_VERIFY_FAILED, append the Windows root store to this venv's
+# certifi/cacert.pem (see project_norton_ssl_mitm_footgun) or pass
+# --trusted-host huggingface.co. The permanent fix is a Norton folder exclusion.
+#
+# torch is installed SEPARATELY via the CUDA-matched cu121 wheel (NOT listed here) —
+# same rule as the pipeline requirements.txt. Models (SDXL-Turbo + sdxl-vae-fp16-fix)
+# download on first run to HF_HOME (default C:\ContentOps\_models\hf).
+
+diffusers>=0.31,<1.0
+transformers>=4.44
+accelerate
+safetensors
+pillow
+numpy

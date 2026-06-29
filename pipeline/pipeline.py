@@ -756,7 +756,7 @@ def generate_script(topic: TopicJob, config: dict) -> ScriptDraft:
             f"the API branch and re-add the matching package to requirements.txt."
         )
 
-    template = load_prompt("03_script_generation", config)
+    template = load_prompt((config.get("prompts") or {}).get("script", "03_script_generation"), config)
     style_guide = load_style_guide(config)
 
     # CTA rotation is the operator's call — inject a directive that points the LLM at the
@@ -2199,7 +2199,16 @@ def fetch_assets(script: ScriptDraft, config: dict) -> AssetBundle:
     """Stage 3: parse B-ROLL cues, search Pexels then Pixabay (per `assets.preferred_stock_provider`),
     download matching portrait clips. Flux fallback is deferred (config.assets.flux_fallback_enabled
     is honored only after ComfyUI is set up — for now, missed cues are logged and skipped).
+
+    Long-form: when is_longform(config), stock fetch is skipped entirely — the visual
+    beats are generated (SDXL + diagrams) at render time by tools.longform_render, so
+    this returns an empty bundle (render_master's long-form path ignores `assets`).
     """
+    from tools.longform_config import is_longform
+    if is_longform(config):
+        log.info("assets: long-form mode — beats built at render time; skipping stock fetch")
+        return AssetBundle(topic_id=script.topic_id, clips=[], images=[], licenses=[])
+
     pexels_key = os.environ.get("PEXELS_API_KEY", "").strip()
     pixabay_key = os.environ.get("PIXABAY_API_KEY", "").strip()
     if not pexels_key and not pixabay_key:
@@ -2286,6 +2295,9 @@ def _strip_visual_directions(text: str) -> str:
     direction or fact-check markers, not spoken content."""
     cues, cleaned = _extract_broll(text)  # also strips [B-ROLL: ...]
     cleaned = re.sub(r"\[VERIFY[^\]]*\]", "", cleaned)
+    # Long-form chapter markers are visual/timestamp directions, never spoken. Shorts
+    # scripts contain no [CHAPTER: ...] tags, so this is a no-op for them.
+    cleaned = re.sub(r"\[CHAPTER[^\]]*\]", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
@@ -2672,9 +2684,14 @@ def generate_captions(vo_path: Path, script: ScriptDraft, config: dict) -> Path:
     if style == "legacy":
         log.info("captions: dispatching to legacy 1-3 word block style")
         return _generate_captions_legacy(vo_path, script, config)
+    if style == "lower_third":
+        log.info("captions: dispatching to long-form lower-third style")
+        from tools.longform_captions import generate_lower_third_captions
+        return generate_lower_third_captions(vo_path, script, config)
     if style != "word_pop":
         raise ValueError(
-            f"captions.style={style!r} is not a valid value; expected 'word_pop' or 'legacy'."
+            f"captions.style={style!r} is not a valid value; expected "
+            f"'word_pop', 'lower_third', or 'legacy'."
         )
 
     from tools.caption_word_pop import (
@@ -2835,7 +2852,20 @@ def render_master(
     Windows path note: the ASS/subtitles filter struggles with drive-letter colons in
     its filename argument. We work around it by running ffmpeg with cwd set to the
     captions file's directory and passing a relative basename to the `ass` filter.
+
+    Long-form: when is_longform(config), delegate to tools.longform_render — beats
+    are built at render time from the VO duration and `assets` is ignored. Returns
+    the same _master_output_path so the lock/integrity/skip-guard wrapping is intact.
     """
+    from tools.longform_config import is_longform
+    if is_longform(config):
+        from tools.longform_render import render_master_longform
+        return render_master_longform(
+            script, vo_path, captions_path, config,
+            _master_output_path(config, script.topic_id),
+            force_encoder=force_encoder,
+        )
+
     import ffmpeg
     import subprocess
 
@@ -3255,22 +3285,27 @@ def generate_variants(master_path: Path, config: dict) -> dict[Platform, Path]:
         if r.returncode != 0:
             raise RuntimeError(f"variant encode failed for {out_path.name}:\n{(r.stderr or '')[-1500:]}")
 
-    log.info("variants: TT (0.3s fade-in)")
-    _fade_variant(tt_path, 0.3)
-    log.info("variants: IG (0.5s fade-in)")
-    _fade_variant(ig_path, 0.5)
+    # Variant platform set is config-gated (long-form = YouTube-only). Absent =>
+    # all three (Shorts byte-identical). YouTube is always built (the primary).
+    platforms = (config.get("variants", {}) or {}).get("platforms") or [
+        "youtube", "tiktok", "instagram"]
+    out = {"youtube": yt_path}
+    if "tiktok" in platforms:
+        log.info("variants: TT (0.3s fade-in)")
+        _fade_variant(tt_path, 0.3)
+        out["tiktok"] = tt_path
+    if "instagram" in platforms:
+        log.info("variants: IG (0.5s fade-in)")
+        _fade_variant(ig_path, 0.5)
+        out["instagram"] = ig_path
 
-    log.info(
-        "variants done: YT=%.1fMB TT=%.1fMB IG=%.1fMB",
-        yt_path.stat().st_size / 1e6,
-        tt_path.stat().st_size / 1e6,
-        ig_path.stat().st_size / 1e6,
-    )
-    return {"youtube": yt_path, "tiktok": tt_path, "instagram": ig_path}
+    log.info("variants done: %s",
+             ", ".join(f"{k}={v.stat().st_size / 1e6:.1f}MB" for k, v in out.items()))
+    return out
 
 
 _METADATA_SECTION_RE = re.compile(
-    r"(?:^|\n)\s*(?:##\s*)?(YOUTUBE\s*SHORTS|TIKTOK|INSTAGRAM\s*REELS|COVER(?:\s*/\s*THUMBNAIL(?:\s+CONCEPT)?)?|PINNED\s*COMMENT)"
+    r"(?:^|\n)\s*(?:##\s*)?(YOUTUBE(?:\s*SHORTS)?|TIKTOK|INSTAGRAM\s*REELS|COVER(?:\s*/\s*THUMBNAIL(?:\s+CONCEPT)?)?|PINNED\s*COMMENT)"
     r"\s*:?\s*\n",
     re.IGNORECASE,
 )
@@ -3334,7 +3369,7 @@ def _parse_metadata_response(response: str, topic_id: str) -> MetadataBundle:
         end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
         sections[key] = response[m.end():end]
 
-    yt = sections.get("YOUTUBE SHORTS", "")
+    yt = sections.get("YOUTUBE SHORTS", "") or sections.get("YOUTUBE", "")
     tt = sections.get("TIKTOK", "")
     ig = sections.get("INSTAGRAM REELS", "")
     cv = (
@@ -3349,8 +3384,14 @@ def _parse_metadata_response(response: str, topic_id: str) -> MetadataBundle:
     pc = sections.get("PINNED COMMENT", "").strip()
     pc = re.sub(r"^[-*]\s+", "", pc).strip()
 
-    missing = [name for name, text in [("YOUTUBE SHORTS", yt), ("TIKTOK", tt),
-                                        ("INSTAGRAM REELS", ig), ("COVER", cv)] if not text]
+    # Long-form (YouTube-only) metadata uses a "YOUTUBE" section and omits TikTok/
+    # Instagram by design (that track does not cross-post). Relax the cross-platform
+    # requirement for it; the empty tiktok/instagram fields are valid on MetadataBundle.
+    youtube_only = "YOUTUBE SHORTS" not in sections and bool(yt)
+    required = ([("YOUTUBE", yt), ("COVER", cv)] if youtube_only
+                else [("YOUTUBE SHORTS", yt), ("TIKTOK", tt),
+                      ("INSTAGRAM REELS", ig), ("COVER", cv)])
+    missing = [name for name, text in required if not text]
     if missing:
         raise ValueError(
             f"Metadata response missing required section(s): {', '.join(missing)}. "
@@ -3425,7 +3466,7 @@ def generate_metadata(script: ScriptDraft, config: dict) -> MetadataBundle:
             f"Set to 'manual' in config.yaml."
         )
 
-    template = load_prompt("06_metadata_generation", config)
+    template = load_prompt((config.get("prompts") or {}).get("metadata", "06_metadata_generation"), config)
     style_guide = load_style_guide(config)
 
     # The script content the metadata LLM sees: hooks + final body (post fact-check resolution).
@@ -3766,6 +3807,19 @@ def _run_prepublish_qa(
     check_cited_obs = bool(qa_cfg.get("check_cited_observation", False))
     channel_root = Path(config["paths"]["channel_root"])
 
+    # Config-overridable QA thresholds. Long-form sets landscape resolution, a long
+    # duration ceiling, and a lower caption-density floor (sparse lower-thirds vs the
+    # dense Shorts word-pop). Absent => check_variant's Shorts defaults (1080x1920 /
+    # 180s / word-pop density) apply, so the Shorts gate stays byte-identical.
+    threshold_kwargs: dict = {}
+    if qa_cfg.get("expected_resolution") is not None:
+        er = qa_cfg["expected_resolution"]
+        threshold_kwargs["expected_resolution"] = (int(er[0]), int(er[1]))
+    if qa_cfg.get("max_duration_s") is not None:
+        threshold_kwargs["max_duration_s"] = float(qa_cfg["max_duration_s"])
+    if qa_cfg.get("min_caption_density") is not None:
+        threshold_kwargs["min_caption_density"] = float(qa_cfg["min_caption_density"])
+
     aggregated_failures: dict[str, dict[int, dict[str, str]]] = {}
     for platform, video_path in variants.items():
         log.info("Stage 11: prepublish QA for %s -> %s", platform, video_path.name)
@@ -3779,6 +3833,7 @@ def _run_prepublish_qa(
             captions_path=captions_path,
             channel_root=channel_root,
             check_cited_observation=check_cited_obs,
+            **threshold_kwargs,
         )
         if not report.ok:
             failures = report.failures_dict()
